@@ -1,0 +1,748 @@
+library(shiny)
+library(bslib)
+library(DBI)
+library(RPostgres)
+library(dplyr)
+library(ggplot2)
+library(DT)
+library(shinyWidgets)
+library(shinyjs)
+
+# --- 1. DATABASE CONNECTION ---
+db_connect <- function() {
+  dbConnect(
+    RPostgres::Postgres(),
+    dbname   = 'postgres',
+    host     = 'aws-1-ap-south-1.pooler.supabase.com', # Update this
+    port     = 5432,
+    user     = 'postgres.wwyjvsakzaiwstwqyxqk',
+    password = 'Anrw1024098#'         # Update this
+  )
+}
+
+# --- 2. UI STRUCTURE ---
+# Main Application UI (Hidden until login)
+ui_main_app <- function(role) {
+  navbarPage(
+    title = "ProTrack Manufacturing",
+    theme = bs_theme(bootswatch = "flatly", primary = "#2c3e50"),
+  
+  # DASHBOARD PAGE
+  tabPanel("Dashboard",
+    fluidRow(
+      column(3, uiOutput("dash_total_cases")),
+      column(3, uiOutput("dash_avg_ne")),
+      column(3, uiOutput("dash_avg_te")),
+      column(3, uiOutput("dash_active_lines"))
+    ),
+    hr(),
+    fluidRow(
+      column(8, plotOutput("daily_trend_plot")),
+      column(4, h4("Last Hour Status"), DTOutput("status_table_mini"))
+    )
+  ),
+  
+  # HOURLY ENTRY PAGE
+  tabPanel("Hourly Entry",
+    sidebarLayout(
+      sidebarPanel(
+        h4("Shift Header"),
+        selectInput("in_line", "Line:", choices = c("Line-1", "Line-2", "Line-3", "Line-4", "Line-5", "Line-6")),
+        selectInput("in_shift", "Shift:", choices = c("A", "B", "C")),
+        dateInput("in_date", "Date:", value = Sys.Date()),
+        selectInput("in_eng", "Shift Engineer:", choices = NULL),
+        hr(),
+        h4("Production Data"),
+        selectInput("in_time", "Time Duration:", choices = NULL),
+        selectInput("in_sku", "SKU Name:", choices = NULL),
+        numericInput("in_qty", "Actual Production (Cases):", value = 0),
+        actionButton("submit_btn", "Submit Hourly Report", class = "btn-success", width = "100%")
+      ),
+      mainPanel(
+        h4("Breakdowns in this Hour"),
+        fluidRow(
+          column(4, textInput("bd_rsn", "Reason")),
+          column(3, numericInput("bd_min", "Min", 0)),
+          column(5, selectInput("bd_tp", "Type", choices = c("ChangeOver", "Operational", "Maintenance")))
+        ),
+        actionButton("add_bd", "Add Breakdown", class = "btn-info"),
+        tableOutput("temp_bd_list"),
+        hr(),
+        uiOutput("live_calc_ui")
+      )
+    )
+  ),
+  # PAGE 3: REPORTS
+  tabPanel("Reports",
+           fluidRow(
+             column(4, dateRangeInput("rep_date", "Select Range:", start = Sys.Date()-7, end = Sys.Date())),
+             column(4, selectInput("rep_line", "Line:", choices = c("All", "Line-1", "Line-2", "Line-3", "Line-4", "Line-5", "Line-6")))
+           ),
+           DTOutput("full_report_table")
+  ),
+
+  # CONFIGURATION PAGE
+  tabPanel("Configuration",
+    navlistPanel(
+      # Admin Only: User Management
+      if(role == "Admin") tabPanel("User Management", 
+        wellPanel(
+          h4("User Administration"),
+          fluidRow(
+            column(4, textInput("new_u_name", "Username")),
+            column(4, textInput("new_u_pass", "Password")),
+            column(4, selectInput("new_u_role", "Role", choices = c("Engineer", "Admin")))
+          ),
+          actionButton("save_user", "Create/Update User", class = "btn-success")
+        ),
+        DTOutput("table_users")
+      ),
+      tabPanel("Engineers Database",
+        textInput("new_eng", "Engineer Name:"),
+        actionButton("save_eng", "Add Engineer"),
+        DTOutput("table_eng")
+      ),
+      tabPanel("SKU & Capacity (BPM)",
+        wellPanel(
+          fluidRow(
+            column(4, textInput("sku_n", "SKU Name")),
+            column(4, numericInput("sku_v", "Volume (ml)", 250)),
+            column(4, numericInput("sku_bpc", "Bottles/Case", 12))
+          ),
+          actionButton("save_sku", "Save SKU", class = "btn-primary")
+        ),
+        wellPanel(
+          h4("Line Capacity (BPM)"),
+          fluidRow(
+            column(4, selectInput("cap_line", "Line", c("Line-1", "Line-2", "Line-3", "Line-4", "Line-5", "Line-6"))),
+            column(4, selectInput("cap_vol", "For Volume (ml)", choices = NULL)),
+            column(4, numericInput("cap_bpm", "BPM", 0))
+          ),
+          actionButton("save_cap", "Update BPM", class = "btn-success")
+        ),
+        DTOutput("table_sku_list")
+      ),
+      tabPanel("Line-SKU Mapping",
+        wellPanel(
+          h4("Streamline Line Capacity"),
+          helpText("Select which SKUs are allowed for each line."),
+          fluidRow(
+            column(6, selectInput("map_line", "Select Line", 
+                                  choices = c("Line-1", "Line-2", "Line-3", "Line-4", "Line-5", "Line-6"))),
+            column(6, checkboxGroupInput("map_skus", "Select Available SKUs", choices = NULL))
+          ),
+          actionButton("save_mapping", "Update Line Mapping", class = "btn-warning")
+        ),
+        hr(),
+        h4("Current Line-wise SKU Assignment"),
+        # This is the new table output
+        DTOutput("table_line_sku_view")
+      )
+    )
+  ),
+
+    # Add a logout button in the navbar
+    header = tags$div(style="position: absolute; right: 20px; top: 10px; z-index: 1000;", 
+                      actionButton("logout_btn", "Logout", class="btn-sm btn-outline-danger"))
+  )
+}
+
+# The actual UI that Shiny loads initially
+ui <- fluidPage(
+  shinyjs::useShinyjs(),
+  theme = bs_theme(bootswatch = "flatly"),
+  uiOutput("page_content")
+)
+
+# --- 3. SERVER LOGIC ---
+server <- function(input, output, session) {
+  
+  # Reactive values for session management
+  auth <- reactiveValues(logged_in = FALSE, user = NULL, role = NULL)
+  refresh_users <- reactiveVal(0)
+  is_editing_user <- reactiveVal(NULL)
+
+  # 1. LOGIN UI GATEKEEPER
+  output$page_content <- renderUI({
+    # We create a local dependency on auth$logged_in
+    if (!auth$logged_in) {
+      # Show Login Screen
+      tagList(
+        fluidRow(
+          column(4, offset = 4, style = "margin-top: 100px;",
+            wellPanel(
+              h3("ProTrack Login", align = "center"),
+              textInput("login_user", "Username"),
+              passwordInput("login_pass", "Password"),
+              actionButton("login_btn", "Login", class = "btn-primary", width = "100%")
+            )
+          )
+        )
+      )
+    } else {
+      # Show Main App
+      ui_main_app(auth$role)
+    }
+  })
+
+  # 2. LOGIN AUTHENTICATION
+  observeEvent(input$login_btn, {
+    con <- db_connect()
+    user_data <- dbGetQuery(con, sprintf(
+      "SELECT username, role FROM app_users WHERE username = '%s' AND password = '%s'",
+      input$login_user, input$login_pass
+    ))
+    dbDisconnect(con)
+
+    if (nrow(user_data) == 1) {
+      auth$logged_in <- TRUE
+      auth$user <- user_data$username[1]
+      auth$role <- user_data$role[1]
+      showNotification(paste("Welcome,", auth$user), type = "message")
+    } else {
+      showNotification("Invalid Username or Password", type = "error")
+    }
+  })
+
+  # --- LOGOUT LOGIC ---
+  observeEvent(input$logout_btn, {
+    # 1. Close any open modals
+    removeModal()
+    
+    # 2. Reset local reactive states (Clean up R side)
+    auth$logged_in <- FALSE
+    auth$user <- NULL
+    auth$role <- NULL
+    
+    # 3. Force a hard browser reload (Clean up JavaScript/UI side)
+    # This completely kills the "dimmed" screen and clears navigation cache
+    shinyjs::runjs("location.reload();") 
+  })
+
+  # 3. USER MANAGEMENT (Admin Only)
+  # --- USER MANAGEMENT TABLE (ADMIN ONLY) ---
+  output$table_users <- renderDT({
+    req(auth$role == "Admin")
+    refresh_users()
+    con <- db_connect()
+    df <- dbGetQuery(con, "SELECT id, username, role FROM app_users")
+    dbDisconnect(con)
+    
+    if(nrow(df) > 0) {
+      df$Actions <- paste0(
+        '<button class="btn btn-info btn-sm" onclick="Shiny.setInputValue(\'edit_user_id\', ', df$id, ', {priority: \'event\'})">Edit</button> ',
+        '<button class="btn btn-danger btn-sm" onclick="Shiny.setInputValue(\'delete_user_id\', ', df$id, ', {priority: \'event\'})">Delete</button>'
+      )
+    }
+    datatable(df, escape = FALSE, selection = 'none')
+  })
+
+  # User Edit Logic (Administrator Function)
+  observeEvent(input$edit_user_id, {
+    req(auth$role == "Admin")
+    con <- db_connect()
+    user <- dbGetQuery(con, sprintf("SELECT * FROM app_users WHERE id = %s", input$edit_user_id))
+    dbDisconnect(con)
+    
+    updateTextInput(session, "new_u_name", value = user$username)
+    updateTextInput(session, "new_u_pass", value = user$password)
+    updateSelectInput(session, "new_u_role", selected = user$role)
+    # We use a reactive to track if we are in "Update" mode
+    is_editing_user(input$edit_user_id)
+  })
+
+  output$user_admin_panel <- renderUI({
+    req(auth$role == "Admin") # Restrict access to Admins
+    tagList(
+      wellPanel(
+        h4("Create New User"),
+        fluidRow(
+          column(4, textInput("new_u_name", "Username")),
+          column(4, textInput("new_u_pass", "Password")),
+          column(4, selectInput("new_u_role", "Role", choices = c("Engineer", "Admin")))
+        ),
+        actionButton("save_user", "Add User", class = "btn-success")
+      ),
+      DTOutput("table_users")
+    )
+  })
+
+  # Logic to save user
+  observeEvent(input$save_user, {
+    req(auth$role == "Admin")
+    con <- db_connect()
+    if (is.null(is_editing_user())) {
+      dbExecute(con, "INSERT INTO app_users (username, password, role) VALUES ($1, $2, $3)",
+                list(input$new_u_name, input$new_u_pass, input$new_u_role))
+      showNotification("New User Created", type = "message")
+    } else {
+      dbExecute(con, "UPDATE app_users SET username=$1, password=$2, role=$3 WHERE id=$4",
+                list(input$new_u_name, input$new_u_pass, input$new_u_role, is_editing_user()))
+      showNotification("User Updated", type = "message")
+      is_editing_user(NULL) 
+    }
+    dbDisconnect(con)
+    updateTextInput(session, "new_u_name", value = "")
+    updateTextInput(session, "new_u_pass", value = "")
+    refresh_users(refresh_users() + 1)
+  })
+
+  # User Delete Logic (Admin Only)
+  observeEvent(input$delete_user_id, {
+    req(auth$role == "Admin")
+    con <- db_connect()
+    showModal(modalDialog(
+      title = "Confirm User Deletion",
+      "Are you sure you want to permanently delete this user? This action cannot be undone.",
+      footer = tagList(
+        modalButton("Cancel"),
+        actionButton("confirm_delete_user_btn", "Yes, Delete User", class = "btn-danger")
+      )
+    ))
+  })
+  observeEvent(input$confirm_delete_user_btn, {
+    req(auth$role == "Admin")
+    removeModal()
+    
+    tryCatch({
+      con <- db_connect()
+      dbExecute(con, "DELETE FROM app_users WHERE id = $1", list(input$delete_user_id))
+      dbDisconnect(con)
+      
+      refresh_users(refresh_users() + 1)
+      showNotification("User deleted successfully.", type = "warning")
+    }, error = function(e) {
+      showNotification(paste("Error:", e$message), type = "error")
+    })
+  })
+  
+  # (Include all your existing production and config logic here)
+
+  # Reactive triggers
+  refresh_data <- reactiveVal(0)
+  refresh_cfg <- reactiveVal(0)
+  temp_bds <- reactiveVal(data.frame(Reason=character(), Min=numeric(), Type=character()))
+
+
+  # --- CONFIGURATION LOGIC ---
+  observe({
+    refresh_cfg()
+    refresh_data()
+    req(auth$logged_in)
+    con <- db_connect()
+    engs <- dbGetQuery(con, "SELECT name FROM config_engineers")$name
+    skus <- dbGetQuery(con, "SELECT sku_name FROM config_skus")$sku_name
+    vols <- dbGetQuery(con, "SELECT DISTINCT sku_volume_ml FROM config_skus")$sku_volume_ml
+    dbDisconnect(con)
+    
+    updateSelectInput(session, "in_eng", 
+                      choices = engs, 
+                      selected = auth$user) # Defaults to the person logged in
+    updateSelectInput(session, "in_sku", choices = skus)
+    updateSelectInput(session, "cap_vol", choices = vols)
+  })
+# --- CONFIG: ADD ENGINEER ---
+  observeEvent(input$save_eng, {
+    req(input$new_eng) # Don't run if empty
+    
+    tryCatch({
+      con <- db_connect()
+      dbExecute(con, "INSERT INTO config_engineers (name) VALUES ($1) ON CONFLICT (name) DO NOTHING", 
+                list(input$new_eng))
+      dbDisconnect(con)
+      
+      # SUCCESS FEEDBACK
+      showNotification(paste("Engineer", input$new_eng, "Added!"), type = "message")
+      updateTextInput(session, "new_eng", value = "") # Clear input
+      refresh_data(refresh_data() + 1)               # Trigger UI refresh
+      
+    }, error = function(e) {
+      showNotification(paste("Error:", e$message), type = "error")
+    })
+  })
+
+  # --- CONFIG: ADD SKU ---
+  observeEvent(input$save_sku, {
+    req(input$sku_n, input$sku_v)
+    
+    tryCatch({
+      con <- db_connect()
+      dbExecute(con, "INSERT INTO config_skus (sku_name, sku_volume_ml, bottles_per_case) 
+                      VALUES ($1, $2, $3) 
+                      ON CONFLICT (sku_name) DO UPDATE SET 
+                      sku_volume_ml = EXCLUDED.sku_volume_ml, 
+                      bottles_per_case = EXCLUDED.bottles_per_case", 
+                list(input$sku_n, input$sku_v, input$sku_bpc))
+      dbDisconnect(con)
+      
+      showNotification("SKU Saved/Updated Successfully!", type = "message")
+      refresh_data(refresh_data() + 1)
+      
+    }, error = function(e) {
+      showNotification(paste("Database Error:", e$message), type = "error")
+    })
+  })
+
+  observeEvent(input$save_cap, {
+    req(input$cap_line, input$cap_vol, input$cap_bpm)
+    showNotification("Updating BPM record...", id = "bpm_load", duration = NULL)
+    tryCatch({
+      con <- db_connect()
+      dbExecute(con, 
+            "INSERT INTO config_line_capacity (line_no, sku_volume_ml, bpm) 
+            VALUES ($1, $2, $3) 
+            ON CONFLICT (line_no, sku_volume_ml) 
+            DO UPDATE SET bpm = EXCLUDED.bpm", 
+            list(input$cap_line, input$cap_vol, input$cap_bpm)
+      )
+      dbDisconnect(con)
+      removeNotification("bpm_load")
+      showNotification(
+        ui = paste("Success! Capacity for", input$cap_line, "at", input$cap_vol, "ml updated to", input$cap_bpm, "BPM."),
+        type = "message", # This makes it green/blue depending on theme
+        duration = 5      # Stays for 5 seconds
+      )
+      refresh_data(refresh_data() + 1)
+    }, 
+    error = function(e) {
+      removeNotification("bpm_load")
+      showNotification(paste("Update Failed:", e$message), type = "error")
+    })
+  })
+  
+  # --- HOURLY SUBMISSION ---
+  observeEvent(input$submit_btn, {
+      req(input$in_line, input$in_sku, input$in_qty)
+      
+      showNotification("Submitting Production Report...", id = "submitting", duration = NULL)
+      
+      tryCatch({
+        con <- db_connect()
+        
+        # 1. Get Theoretical Output for this specific entry to save as a snapshot
+        res_theo <- dbGetQuery(con, sprintf(
+          "SELECT c.bpm, s.bottles_per_case FROM config_line_capacity c 
+          JOIN config_skus s ON c.sku_volume_ml = s.sku_volume_ml 
+          WHERE c.line_no = '%s' AND s.sku_name = '%s'", input$in_line, input$in_sku
+        ))
+        
+        theo_val <- if(nrow(res_theo) > 0) {
+          (res_theo$bpm[1] * 60) / res_theo$bottles_per_case[1]
+        } else { 0 }
+        
+        # 2. Insert into production_logs
+        insert_query <- "INSERT INTO production_logs 
+                        (line_no, shift, prod_date, engineer, time_slot, sku, actual_qty, theo_output_val) 
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id"
+        
+        log_id_res <- dbGetQuery(con, insert_query, list(
+          input$in_line, input$in_shift, input$in_date, input$in_eng, 
+          input$in_time, input$in_sku, input$in_qty, theo_val
+        ))
+        
+        log_id <- log_id_res$id[1]
+        
+        # 3. Insert associated breakdowns if any exist in the temp table
+        bds <- temp_bds()
+        if(nrow(bds) > 0) {
+          for(i in 1:nrow(bds)) {
+            dbExecute(con, "INSERT INTO breakdowns (log_id, reason, duration_min, bd_type) 
+                            VALUES ($1, $2, $3, $4)", 
+                      list(log_id, bds$Reason[i], bds$Min[i], bds$Type[i]))
+          }
+        }
+        
+        dbDisconnect(con)
+        
+        # Cleanup
+        removeNotification("submitting")
+        showNotification("Report Saved Successfully!", type = "message")
+        temp_bds(data.frame(Reason=character(), Min=numeric(), Type=character())) # Clear temp breakdowns
+        updateNumericInput(session, "in_qty", value = 0) # Reset Qty field
+        
+      }, error = function(e) {
+        removeNotification("submitting")
+        showNotification(paste("Submission Error:", e$message), type = "error")
+      })
+  })
+
+  # --- ENTRY LOGIC ---
+  # --- SHIFT-BASED TIME SELECTION ---
+  observeEvent(input$in_shift, {
+    shift_times <- switch(input$in_shift,
+      "A" = c("07:00 - 08:00", "08:00 - 09:00", "09:00 - 10:00", "10:00 - 11:00", 
+              "11:00 - 12:00", "12:00 - 13:00", "13:00 - 14:00", "14:00 - 15:00"),
+      "B" = c("15:00 - 16:00", "16:00 - 17:00", "17:00 - 18:00", "18:00 - 19:00", 
+              "19:00 - 20:00", "20:00 - 21:00", "21:00 - 22:00", "22:00 - 23:00"),
+      "C" = c("23:00 - 00:00", "00:00 - 01:00", "01:00 - 02:00", "02:00 - 03:00", 
+              "03:00 - 04:00", "04:00 - 05:00", "05:00 - 06:00", "06:00 - 07:00")
+    )
+    
+    updateSelectInput(session, "in_time", choices = shift_times)
+  })
+
+  observeEvent(input$add_bd, {
+    new_data <- data.frame(Reason = input$bd_rsn, Min = input$bd_min, Type = input$bd_tp)
+    temp_bds(rbind(temp_bds(), new_data))
+  })
+  
+  output$temp_bd_list <- renderTable({ temp_bds() })
+
+  # Live KPI Calculation
+  output$live_calc_ui <- renderUI({
+    con <- db_connect()
+    # Fetch BPM for current selection
+    res <- dbGetQuery(con, sprintf(
+      "SELECT c.bpm, s.bottles_per_case FROM config_line_capacity c 
+       JOIN config_skus s ON c.sku_volume_ml = s.sku_volume_ml 
+       WHERE c.line_no = '%s' AND s.sku_name = '%s'", input$in_line, input$in_sku
+    ))
+    dbDisconnect(con)
+    
+    if(nrow(res) == 0) return(p("Please set BPM for this SKU/Line in Config first."))
+    
+    theo_hr <- (res$bpm[1] * 60) / res$bottles_per_case[1]
+    ne <- (input$in_qty / theo_hr) * 100
+    te <- (input$in_qty / (theo_hr * ((60 - sum(temp_bds()$Min))/60))) * 100
+    
+    wellPanel(
+      h4("Current Performance"),
+      p(paste("Theo Output/Hr:", round(theo_hr, 0), "Cases")),
+      p(paste("NE%:", round(ne, 1), "%")),
+      p(paste("TE%:", round(te, 1), "%"))
+    )
+  })
+
+  # 1. Update Checkbox choices in Config
+  observe({
+    refresh_data()
+    con <- db_connect()
+    all_skus <- dbGetQuery(con, "SELECT sku_name FROM config_skus")$sku_name
+    dbDisconnect(con)
+    updateCheckboxGroupInput(session, "map_skus", choices = all_skus)
+  })
+
+  # 2. Save Mapping Logic
+  observeEvent(input$save_mapping, {
+    req(input$map_line)
+    con <- db_connect()
+    # Clear existing mapping for this line
+    dbExecute(con, "DELETE FROM config_line_sku_mapping WHERE line_no = $1", list(input$map_line))
+    # Insert new mapping
+    if(!is.null(input$map_skus)){
+      for(s in input$map_skus){
+        dbExecute(con, "INSERT INTO config_line_sku_mapping (line_no, sku_name) VALUES ($1, $2)", 
+                  list(input$map_line, s))
+      }
+    }
+    dbDisconnect(con)
+    showNotification(paste("Mapping updated for", input$map_line), type = "message")
+    refresh_data(refresh_data() + 1)
+  })
+
+  # 3. THE STREAMLINE FILTER (For Hourly Entry Page)
+  observeEvent(input$in_line, {
+    con <- db_connect()
+    # Only fetch SKUs assigned to the selected line
+    available_skus <- dbGetQuery(con, sprintf(
+      "SELECT sku_name FROM config_line_sku_mapping WHERE line_no = '%s'", input$in_line
+    ))$sku_name
+    dbDisconnect(con)
+    
+    if(length(available_skus) == 0) {
+      updateSelectInput(session, "in_sku", choices = "No SKUs Mapped")
+    } else {
+      updateSelectInput(session, "in_sku", choices = available_skus)
+    }
+  })
+
+  # 1. Render the Capacity Table with a Delete Button
+  output$table_sku_list <- renderDT({
+    refresh_data()
+    con <- db_connect()
+    # Fetch ID so we know which row to delete
+    df <- dbGetQuery(con, "SELECT id, line_no, sku_volume_ml, bpm FROM config_line_capacity")
+    dbDisconnect(con)
+    
+    # Create the Action Button HTML for each row
+    if(nrow(df) > 0) {
+      df$Actions <- paste0(
+        '<button class="btn btn-danger btn-sm" onclick="Shiny.setInputValue(\'delete_bpm_id\', ', df$id, ', {priority: \'event\'})">
+          <i class="glyphicon glyphicon-trash"></i> Delete
+        </button>'
+      )
+    }
+    
+    # IMPORTANT: escape = FALSE allows the HTML in the 'Actions' column to render as a button
+    datatable(df, 
+              escape = FALSE, 
+              selection = 'none', 
+              options = list(pageLength = 10, columnDefs = list(list(className = 'dt-center', targets = "_all"))))
+  })
+
+  # 2. Logic to handle the Deletion when a button is clicked
+  observeEvent(input$delete_bpm_id, {
+    target_id <- input$delete_bpm_id
+    
+    # Ask for confirmation (Optional but recommended)
+    showModal(modalDialog(
+      title = "Confirm Deletion",
+      paste("Are you sure you want to delete capacity entry ID:", target_id, "?"),
+      footer = tagList(
+        modalButton("Cancel"),
+        actionButton("confirm_delete_btn", "Yes, Delete", class = "btn-danger")
+      )
+    ))
+  })
+
+  # 3. Final Execution of Delete after Confirmation
+  observeEvent(input$confirm_delete_btn, {
+    removeModal()
+    target_id <- input$delete_bpm_id
+    
+    tryCatch({
+      con <- db_connect()
+      dbExecute(con, "DELETE FROM config_line_capacity WHERE id = $1", list(target_id))
+      dbDisconnect(con)
+      
+      showNotification("Entry deleted successfully.", type = "warning")
+      refresh_data(refresh_data() + 1) # Refresh the table
+      
+    }, error = function(e) {
+      showNotification(paste("Error:", e$message), type = "error")
+    })
+  })
+
+  # 1. Listen for the button click and show a confirmation popup
+  observeEvent(input$delete_bpm_id, {
+    showModal(modalDialog(
+      title = "Confirm Deletion",
+      "Are you sure you want to delete this capacity entry?",
+      footer = tagList(
+        modalButton("Cancel"),
+        actionButton("confirm_delete_btn", "Yes, Delete", class = "btn-danger")
+      )
+    ))
+  })
+
+  # 2. Execute the SQL Delete after the user confirms
+  observeEvent(input$confirm_delete_btn, {
+    removeModal()
+    target_id <- input$delete_bpm_id
+    
+    tryCatch({
+      con <- db_connect()
+      dbExecute(con, "DELETE FROM config_line_capacity WHERE id = $1", list(target_id))
+      dbDisconnect(con)
+      
+      showNotification("Entry Deleted", type = "warning")
+      refresh_data(refresh_data() + 1) # Force table to redraw
+    }, error = function(e) {
+      showNotification(paste("Error:", e$message), type = "error")
+    })
+  })
+
+  # --- ENGINEER TABLE WITH DELETE ---
+  output$table_eng <- renderDT({
+    refresh_data()
+    con <- db_connect()
+    df <- dbGetQuery(con, "SELECT id, name FROM config_engineers ORDER BY id DESC")
+    dbDisconnect(con)
+    
+    if(nrow(df) > 0) {
+      df$Actions <- paste0(
+        '<button class="btn btn-danger btn-sm" onclick="Shiny.setInputValue(\'delete_eng_id\', ', df$id, ', {priority: \'event\'})">Delete</button>'
+      )
+    }
+    datatable(df, escape = FALSE, selection = 'none')
+  })
+
+  # Engineer Delete Observer
+  observeEvent(input$delete_eng_id, {
+    showModal(modalDialog(
+      title = "Confirm Deletion",
+      "Delete this engineer from the configuration?",
+      footer = tagList(
+        modalButton("Cancel"),
+        actionButton("confirm_delete_eng", "Yes, Delete", class = "btn-danger")
+      )
+    ))
+  })
+
+  observeEvent(input$confirm_delete_eng, {
+    removeModal()
+    tryCatch({
+      con <- db_connect()
+      dbExecute(con, "DELETE FROM config_engineers WHERE id = $1", list(input$delete_eng_id))
+      dbDisconnect(con)
+      showNotification("Engineer Deleted", type = "warning")
+      refresh_data(refresh_data() + 1)
+    }, error = function(e) { showNotification(e$message, type = "error") })
+  })
+
+  # --- SKU TABLE WITH DELETE ---
+  output$table_sku_list <- renderDT({
+    refresh_data()
+    con <- db_connect()
+    df <- dbGetQuery(con, "SELECT id, sku_name, sku_volume_ml, bottles_per_case FROM config_skus ORDER BY sku_name")
+    dbDisconnect(con)
+    
+    if(nrow(df) > 0) {
+      df$Actions <- paste0(
+        '<button class="btn btn-danger btn-sm" onclick="Shiny.setInputValue(\'delete_sku_id\', ', df$id, ', {priority: \'event\'})">Delete</button>'
+      )
+    }
+    datatable(df, escape = FALSE, selection = 'none')
+  })
+
+  # --- DISPLAY LINE-WISE SKU MAPPING ---
+  output$table_line_sku_view <- renderDT({
+    refresh_data() # Table refreshes whenever you save a new mapping
+    con <- db_connect()
+    
+    # Fetch the mapping joined with SKU details for a better view
+    df <- dbGetQuery(con, "
+      SELECT 
+        m.line_no AS \"Line\", 
+        m.sku_name AS \"SKU Name\", 
+        s.sku_volume_ml AS \"Volume (ml)\"
+      FROM config_line_sku_mapping m
+      JOIN config_skus s ON m.sku_name = s.sku_name
+      ORDER BY m.line_no, s.sku_volume_ml
+    ")
+    
+    dbDisconnect(con)
+    
+    datatable(df, 
+              filter = 'top', # Adds search boxes per column
+              options = list(pageLength = 10, autoWidth = TRUE),
+              rownames = FALSE)
+  })
+
+  # SKU Delete Observer
+  observeEvent(input$delete_sku_id, {
+    showModal(modalDialog(
+      title = "Confirm Deletion",
+      "Are you sure? This may affect existing Line Capacity mappings.",
+      footer = tagList(
+        modalButton("Cancel"),
+        actionButton("confirm_delete_sku", "Yes, Delete", class = "btn-danger")
+      )
+    ))
+  })
+
+  observeEvent(input$confirm_delete_sku, {
+    removeModal()
+    tryCatch({
+      con <- db_connect()
+      dbExecute(con, "DELETE FROM config_skus WHERE id = $1", list(input$delete_sku_id))
+      dbDisconnect(con)
+      showNotification("SKU Deleted", type = "warning")
+      refresh_data(refresh_data() + 1)
+    }, error = function(e) { 
+      showNotification("Cannot delete SKU: It is currently mapped to a Line Capacity entry.", type = "error") 
+    })
+  })
+}
+shinyApp(ui, server)
+
