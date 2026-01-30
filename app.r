@@ -102,8 +102,9 @@ ui_main_app <- function(role) {
         actionButton("save_eng", "Add Engineer"),
         DTOutput("table_eng")
       ),
-      tabPanel("SKU & Capacity (BPM)",
+      tabPanel("SKU Database",
         wellPanel(
+          h4("Manage SKU Master Data"),
           fluidRow(
             column(4, textInput("sku_n", "SKU Name")),
             column(4, numericInput("sku_v", "Volume (ml)", 250)),
@@ -111,33 +112,61 @@ ui_main_app <- function(role) {
           ),
           actionButton("save_sku", "Save SKU", class = "btn-primary")
         ),
-        wellPanel(
-          h4("Line Capacity (BPM)"),
-          fluidRow(
-            column(4, selectInput("cap_line", "Line", c("Line-1", "Line-2", "Line-3", "Line-4", "Line-5", "Line-6"))),
-            column(4, selectInput("cap_vol", "For Volume (ml)", choices = NULL)),
-            column(4, numericInput("cap_bpm", "BPM", 0))
-          ),
-          actionButton("save_cap", "Update BPM", class = "btn-success")
-        ),
-        DTOutput("table_sku_list")
+        DTOutput("table_sku_master")
       ),
       tabPanel("Line-SKU Mapping",
         wellPanel(
           h4("Streamline Line Capacity"),
-          helpText("Select which SKUs are allowed for each line."),
           fluidRow(
-            column(6, selectInput("map_line", "Select Line", 
-                                  choices = c("Line-1", "Line-2", "Line-3", "Line-4", "Line-5", "Line-6"))),
-            column(6, checkboxGroupInput("map_skus", "Select Available SKUs", choices = NULL))
+            column(4, 
+              selectInput("map_line", "Select Line", 
+                          choices = c("Line-1", "Line-2", "Line-3", "Line-4", "Line-5", "Line-6"))
+            ),
+            column(8,
+              h5("Currently Mapped SKUs:"),
+              uiOutput("current_mapping_badges") # Graphical display of existing setup
+            )
           ),
-          actionButton("save_mapping", "Update Line Mapping", class = "btn-warning")
+          hr(),
+          fluidRow(
+            column(12,
+              pickerInput(
+                inputId = "map_skus",
+                label = "Select Available SKUs for this Line:",
+                choices = NULL, # Filled by server
+                multiple = TRUE,
+                options = pickerOptions(
+                  actionsBox = TRUE, 
+                  liveSearch = TRUE,
+                  selectedTextFormat = "count > 3",
+                  noneSelectedText = "No SKUs Assigned"
+                ),
+                width = "100%"
+              )
+            )
+          ),
+          actionButton("save_mapping", "Update Line Mapping", class = "btn-warning"),
+          actionButton("reset_all_config", "Reset All Line Configurations", 
+                      class = "btn-danger", icon = icon("trash-alt"), style = "margin-left: 10px;")
         ),
         hr(),
-        h4("Current Line-wise SKU Assignment"),
-        # This is the new table output
         DTOutput("table_line_sku_view")
-      )
+      ),
+            tabPanel("Line Capacity (BPM)",
+        wellPanel(
+          h4("Record Line Speeds"),
+          fluidRow(
+            column(4, selectInput("cap_line", "Select Line", 
+                                  choices = c("Line-1", "Line-2", "Line-3", "Line-4", "Line-5", "Line-6"))),
+            column(4, selectInput("cap_sku", "Select SKU", choices = NULL)), # Filtered SKU list
+            column(4, numericInput("cap_bpm", "BPM (Speed)", 0))
+          ),
+          actionButton("save_cap", "Update BPM", class = "btn-success")
+        ),
+        hr(),
+        h4("Current Line Speeds per SKU"),
+        DTOutput("table_bpm_view")
+      ),
     )
   ),
 
@@ -383,30 +412,122 @@ server <- function(input, output, session) {
     })
   })
 
+  # --- SKU MASTER TABLE ---
+  output$table_sku_master <- renderDT({
+    refresh_data()
+    con <- db_connect()
+    # Fetch master SKU data
+    df <- dbGetQuery(con, "SELECT id, sku_name, sku_volume_ml, bottles_per_case FROM config_skus ORDER BY sku_name")
+    dbDisconnect(con)
+    
+    if(nrow(df) > 0) {
+      df$Actions <- paste0(
+        '<button class="btn btn-danger btn-sm" onclick="Shiny.setInputValue(\'delete_sku_id\', ', df$id, ', {priority: \'event\'})">Delete</button>'
+      )
+    }
+    datatable(df, escape = FALSE, selection = 'none', 
+              colnames = c("ID", "SKU Name", "Volume (ml)", "BPC", "Actions"))
+  })
+
+  # 1. Update SKU dropdown based on selected line in the BPM tab
+  observeEvent(input$cap_line, {
+    con <- db_connect()
+    # Only show SKUs mapped to this line for capacity setting
+    mapped_skus <- dbGetQuery(con, sprintf(
+      "SELECT sku_name FROM config_line_sku_mapping WHERE line_no = '%s'", input$cap_line
+    ))$sku_name
+    dbDisconnect(con)
+    
+    updateSelectInput(session, "cap_sku", choices = mapped_skus)
+  })
+
+  # 2. Updated BPM Table View (showing Line, SKU Name, and Speed)
+  output$table_bpm_view <- renderDT({
+    refresh_data()
+    con <- db_connect()
+    # Fetch data directly from the capacity table
+    df <- dbGetQuery(con, "
+      SELECT 
+        id,
+        line_no AS \"Line\", 
+        sku_name AS \"SKU\", 
+        sku_volume_ml AS \"Volume (ml)\",
+        bpm AS \"Speed (BPM)\"
+      FROM config_line_capacity
+      ORDER BY line_no, sku_name
+    ")
+    dbDisconnect(con)
+    
+    if(nrow(df) > 0) {
+      df$Actions <- paste0(
+        '<button class="btn btn-danger btn-sm" onclick="Shiny.setInputValue(\'delete_bpm_id\', ', df$id, ', {priority: \'event\'})">Delete</button>'
+      )
+    }
+    datatable(df, escape = FALSE, selection = 'none', options = list(pageLength = 10))
+  })
+
+  # 1. Confirmation Modal for Reset
+  observeEvent(input$reset_all_config, {
+    req(auth$role == "Admin")
+    showModal(modalDialog(
+      title = "Warning: Full Configuration Reset",
+      "This will delete ALL SKU-to-Line assignments AND all recorded BPM speeds. 
+       The SKU Database will remain intact, but lines will be unconfigured.",
+      footer = tagList(
+        modalButton("Cancel"),
+        actionButton("confirm_full_reset", "Yes, Reset Everything", class = "btn-danger")
+      )
+    ))
+  })
+
+  # 2. Execution Logic (Clears both tables)
+  observeEvent(input$confirm_full_reset, {
+    req(auth$role == "Admin")
+    removeModal()
+    
+    tryCatch({
+      con <- db_connect()
+      # Step 1: Clear the Line-SKU Mappings
+      dbExecute(con, "DELETE FROM config_line_sku_mapping")
+      # Step 2: Clear the BPM Speeds
+      dbExecute(con, "DELETE FROM config_line_capacity")
+      dbDisconnect(con)
+      
+      # Refresh all related UI tables
+      refresh_data(refresh_data() + 1)
+      showNotification("Line mappings and BPM settings cleared.", type = "error")
+    }, error = function(e) {
+      showNotification(paste("Error during reset:", e$message), type = "error")
+    })
+  })
+
   observeEvent(input$save_cap, {
-    req(input$cap_line, input$cap_vol, input$cap_bpm)
+    req(input$cap_line, input$cap_sku, input$cap_bpm)
     showNotification("Updating BPM record...", id = "bpm_load", duration = NULL)
     tryCatch({
       con <- db_connect()
+      # 1. Fetch the volume for the selected SKU name (to satisfy the NOT NULL constraint)
+      sku_info <- dbGetQuery(con, sprintf(
+        "SELECT sku_volume_ml FROM config_skus WHERE sku_name = '%s'", 
+        input$cap_sku
+      ))
+      if(nrow(sku_info) == 0) stop("SKU volume not found in database.")
+      target_vol <- sku_info$sku_volume_ml[1]
+      # 2. Include sku_volume_ml in the INSERT statement
       dbExecute(con, 
-            "INSERT INTO config_line_capacity (line_no, sku_volume_ml, bpm) 
-            VALUES ($1, $2, $3) 
-            ON CONFLICT (line_no, sku_volume_ml) 
-            DO UPDATE SET bpm = EXCLUDED.bpm", 
-            list(input$cap_line, input$cap_vol, input$cap_bpm)
+            "INSERT INTO config_line_capacity (line_no, sku_name, sku_volume_ml, bpm) 
+            VALUES ($1, $2, $3, $4) 
+            ON CONFLICT (line_no, sku_name) 
+            DO UPDATE SET bpm = EXCLUDED.bpm, sku_volume_ml = EXCLUDED.sku_volume_ml", 
+            list(input$cap_line, input$cap_sku, target_vol, input$cap_bpm)
       )
       dbDisconnect(con)
       removeNotification("bpm_load")
-      showNotification(
-        ui = paste("Success! Capacity for", input$cap_line, "at", input$cap_vol, "ml updated to", input$cap_bpm, "BPM."),
-        type = "message", # This makes it green/blue depending on theme
-        duration = 5      # Stays for 5 seconds
-      )
+      showNotification(paste("Speed updated for", input$cap_sku), type = "message")
       refresh_data(refresh_data() + 1)
-    }, 
-    error = function(e) {
+    }, error = function(e) {
       removeNotification("bpm_load")
-      showNotification(paste("Update Failed:", e$message), type = "error")
+      showNotification(paste("Update Error:", e$message), type = "error")
     })
   })
   
@@ -521,6 +642,39 @@ server <- function(input, output, session) {
     dbDisconnect(con)
     updateCheckboxGroupInput(session, "map_skus", choices = all_skus)
   })
+  # 1. Display Current Mapped SKUs as Graphical Badges
+output$current_mapping_badges <- renderUI({
+  req(input$map_line)
+  
+  con <- db_connect()
+  current <- dbGetQuery(con, sprintf(
+    "SELECT sku_name FROM config_line_sku_mapping WHERE line_no = '%s'", input$map_line
+  ))$sku_name
+  dbDisconnect(con)
+  
+  if(length(current) == 0) return(span("No SKUs currently assigned.", style="color: gray; font-style: italic;"))
+  
+  # Create a badge for each SKU
+  lapply(current, function(sku) {
+    span(sku, class = "badge rounded-pill bg-primary", style = "margin-right: 5px; padding: 8px 12px; font-size: 0.9em;")
+  })
+})
+
+# 2. Synchronize PickerInput selection with current mapping
+observeEvent(input$map_line, {
+  con <- db_connect()
+  # All possible SKUs
+  all_skus <- dbGetQuery(con, "SELECT sku_name FROM config_skus")$sku_name
+  # Currently selected SKUs for this line
+  selected_skus <- dbGetQuery(con, sprintf(
+    "SELECT sku_name FROM config_line_sku_mapping WHERE line_no = '%s'", input$map_line
+  ))$sku_name
+  dbDisconnect(con)
+  
+  updatePickerInput(session, "map_skus", 
+                    choices = all_skus, 
+                    selected = selected_skus)
+})
 
   # 2. Save Mapping Logic
   observeEvent(input$save_mapping, {
