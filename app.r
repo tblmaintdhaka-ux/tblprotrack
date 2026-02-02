@@ -7,18 +7,22 @@ library(ggplot2)
 library(DT)
 library(shinyWidgets)
 library(shinyjs)
+library(pool) #
 
-# --- 1. DATABASE CONNECTION ---
-db_connect <- function() {
-  dbConnect(
-    RPostgres::Postgres(),
-    dbname   = 'postgres',
-    host     = 'aws-1-ap-south-1.pooler.supabase.com', # Update this
-    port     = 5432,
-    user     = 'postgres.wwyjvsakzaiwstwqyxqk',
-    password = 'Anrw1024098#'         # Update this
-  )
-}
+# --- 1. PERSISTENT DATABASE POOL ---
+# Initialize the pool outside the server function so it's shared across sessions
+# but maintained by the R process.
+db_pool <- dbPool(
+  RPostgres::Postgres(),
+  dbname   = 'postgres',
+  host     = 'aws-1-ap-south-1.pooler.supabase.com',
+  port     = 5432,
+  user     = 'postgres.wwyjvsakzaiwstwqyxqk',
+  password = 'Anrw1024098#'
+)
+onStop(function() {
+  poolClose(db_pool)
+})
 
 # --- 2. UI STRUCTURE ---
 # Main Application UI (Hidden until login)
@@ -189,7 +193,10 @@ server <- function(input, output, session) {
   # Reactive values for session management
   auth <- reactiveValues(logged_in = FALSE, user = NULL, role = NULL)
   refresh_users <- reactiveVal(0)
+  refresh_data <- reactiveVal(0)
+  refresh_cfg <- reactiveVal(0)
   is_editing_user <- reactiveVal(NULL)
+  temp_bds <- reactiveVal(data.frame(Reason=character(), Min=numeric(), Type=character()))
 
   # 1. LOGIN UI GATEKEEPER
   output$page_content <- renderUI({
@@ -216,12 +223,11 @@ server <- function(input, output, session) {
 
   # 2. LOGIN AUTHENTICATION
   observeEvent(input$login_btn, {
-    con <- db_connect()
-    user_data <- dbGetQuery(con, sprintf(
-      "SELECT username, role FROM app_users WHERE username = '%s' AND password = '%s'",
+    # Use the pool directly instead of db_connect()
+    user_data <- dbGetQuery(db_pool, sprintf(
+          "SELECT username, role FROM app_users WHERE username = '%s' AND password = '%s'",
       input$login_user, input$login_pass
     ))
-    dbDisconnect(con)
 
     if (nrow(user_data) == 1) {
       auth$logged_in <- TRUE
@@ -253,9 +259,7 @@ server <- function(input, output, session) {
   output$table_users <- renderDT({
     req(auth$role == "Admin")
     refresh_users()
-    con <- db_connect()
-    df <- dbGetQuery(con, "SELECT id, username, role FROM app_users")
-    dbDisconnect(con)
+    df <- dbGetQuery(db_pool, "SELECT id, username, role FROM app_users")
     
     if(nrow(df) > 0) {
       df$Actions <- paste0(
@@ -263,21 +267,21 @@ server <- function(input, output, session) {
         '<button class="btn btn-danger btn-sm" onclick="Shiny.setInputValue(\'delete_user_id\', ', df$id, ', {priority: \'event\'})">Delete</button>'
       )
     }
-    datatable(df, escape = FALSE, selection = 'none')
+    datatable(df, escape = FALSE, selection = 'none',
+              colnames = c("ID", "Username", "Role", "Actions"))
   })
 
   # User Edit Logic (Administrator Function)
   observeEvent(input$edit_user_id, {
     req(auth$role == "Admin")
-    con <- db_connect()
-    user <- dbGetQuery(con, sprintf("SELECT * FROM app_users WHERE id = %s", input$edit_user_id))
-    dbDisconnect(con)
-    
-    updateTextInput(session, "new_u_name", value = user$username)
-    updateTextInput(session, "new_u_pass", value = user$password)
-    updateSelectInput(session, "new_u_role", selected = user$role)
-    # We use a reactive to track if we are in "Update" mode
-    is_editing_user(input$edit_user_id)
+    user <- dbGetQuery(db_pool, sprintf("SELECT * FROM app_users WHERE id = %s", input$edit_user_id))
+    if(nrow(user) > 0) {
+      updateTextInput(session, "new_u_name", value = user$username[1])
+      updateTextInput(session, "new_u_pass", value = user$password[1])
+      updateSelectInput(session, "new_u_role", selected = user$role[1])
+      # Set the reactive state to track that we are in "Update" mode rather than "Create"
+      is_editing_user(input$edit_user_id)
+    }
   })
 
   output$user_admin_panel <- renderUI({
@@ -298,28 +302,40 @@ server <- function(input, output, session) {
 
   # Logic to save user
   observeEvent(input$save_user, {
-    req(auth$role == "Admin")
-    con <- db_connect()
-    if (is.null(is_editing_user())) {
-      dbExecute(con, "INSERT INTO app_users (username, password, role) VALUES ($1, $2, $3)",
-                list(input$new_u_name, input$new_u_pass, input$new_u_role))
-      showNotification("New User Created", type = "message")
-    } else {
-      dbExecute(con, "UPDATE app_users SET username=$1, password=$2, role=$3 WHERE id=$4",
-                list(input$new_u_name, input$new_u_pass, input$new_u_role, is_editing_user()))
-      showNotification("User Updated", type = "message")
-      is_editing_user(NULL) 
-    }
-    dbDisconnect(con)
-    updateTextInput(session, "new_u_name", value = "")
-    updateTextInput(session, "new_u_pass", value = "")
-    refresh_users(refresh_users() + 1)
+    req(auth$role == "Admin", input$new_u_name, input$new_u_pass)
+    
+    tryCatch({
+      # Use db_pool directly. The pool automatically manages the connection lifecycle.
+      if (is.null(is_editing_user())) {
+        # Create New User
+        dbExecute(db_pool, 
+                  "INSERT INTO app_users (username, password, role) VALUES ($1, $2, $3)",
+                  list(input$new_u_name, input$new_u_pass, input$new_u_role))
+        showNotification("New User Created", type = "message")
+      } else {
+        # Update Existing User
+        dbExecute(db_pool, 
+                  "UPDATE app_users SET username=$1, password=$2, role=$3 WHERE id=$4",
+                  list(input$new_u_name, input$new_u_pass, input$new_u_role, is_editing_user()))
+        showNotification("User Updated", type = "message")
+        is_editing_user(NULL) # Reset editing state
+      }
+      
+      # Clear Inputs and Refresh
+      updateTextInput(session, "new_u_name", value = "")
+      updateTextInput(session, "new_u_pass", value = "")
+      refresh_users(refresh_users() + 1)
+      
+    }, error = function(e) {
+      showNotification(paste("Database Error:", e$message), type = "error")
+    })
   })
 
   # User Delete Logic (Admin Only)
+  # 1. Trigger the confirmation modal
   observeEvent(input$delete_user_id, {
     req(auth$role == "Admin")
-    con <- db_connect()
+    # No database connection needed just to show the modal
     showModal(modalDialog(
       title = "Confirm User Deletion",
       "Are you sure you want to permanently delete this user? This action cannot be undone.",
@@ -329,17 +345,21 @@ server <- function(input, output, session) {
       )
     ))
   })
+
+  # 2. Execute the deletion once confirmed
   observeEvent(input$confirm_delete_user_btn, {
     req(auth$role == "Admin")
     removeModal()
     
     tryCatch({
-      con <- db_connect()
-      dbExecute(con, "DELETE FROM app_users WHERE id = $1", list(input$delete_user_id))
-      dbDisconnect(con)
+      # Use db_pool directly. 
+      # This avoids the 300-500ms SSL handshake delay required for new connections.
+      dbExecute(db_pool, "DELETE FROM app_users WHERE id = $1", list(input$delete_user_id))
       
+      # Trigger reactive refresh for the user table
       refresh_users(refresh_users() + 1)
       showNotification("User deleted successfully.", type = "warning")
+      
     }, error = function(e) {
       showNotification(paste("Error:", e$message), type = "error")
     })
@@ -358,11 +378,9 @@ server <- function(input, output, session) {
     refresh_cfg()
     refresh_data()
     req(auth$logged_in)
-    con <- db_connect()
-    engs <- dbGetQuery(con, "SELECT name FROM config_engineers")$name
-    skus <- dbGetQuery(con, "SELECT sku_name FROM config_skus")$sku_name
-    vols <- dbGetQuery(con, "SELECT DISTINCT sku_volume_ml FROM config_skus")$sku_volume_ml
-    dbDisconnect(con)
+    engs <- dbGetQuery(db_pool, "SELECT name FROM config_engineers")$name
+    skus <- dbGetQuery(db_pool, "SELECT sku_name FROM config_skus")$sku_name
+    vols <- dbGetQuery(db_pool, "SELECT DISTINCT sku_volume_ml FROM config_skus")$sku_volume_ml
     
     updateSelectInput(session, "in_eng", 
                       choices = engs, 
@@ -375,10 +393,8 @@ server <- function(input, output, session) {
     req(input$new_eng) # Don't run if empty
     
     tryCatch({
-      con <- db_connect()
-      dbExecute(con, "INSERT INTO config_engineers (name) VALUES ($1) ON CONFLICT (name) DO NOTHING", 
+      dbExecute(db_pool, "INSERT INTO config_engineers (name) VALUES ($1) ON CONFLICT (name) DO NOTHING", 
                 list(input$new_eng))
-      dbDisconnect(con)
       
       # SUCCESS FEEDBACK
       showNotification(paste("Engineer", input$new_eng, "Added!"), type = "message")
@@ -395,14 +411,12 @@ server <- function(input, output, session) {
     req(input$sku_n, input$sku_v)
     
     tryCatch({
-      con <- db_connect()
-      dbExecute(con, "INSERT INTO config_skus (sku_name, sku_volume_ml, bottles_per_case) 
+      dbExecute(db_pool, "INSERT INTO config_skus (sku_name, sku_volume_ml, bottles_per_case) 
                       VALUES ($1, $2, $3) 
                       ON CONFLICT (sku_name) DO UPDATE SET 
                       sku_volume_ml = EXCLUDED.sku_volume_ml, 
                       bottles_per_case = EXCLUDED.bottles_per_case", 
                 list(input$sku_n, input$sku_v, input$sku_bpc))
-      dbDisconnect(con)
       
       showNotification("SKU Saved/Updated Successfully!", type = "message")
       refresh_data(refresh_data() + 1)
@@ -415,10 +429,8 @@ server <- function(input, output, session) {
   # --- SKU MASTER TABLE ---
   output$table_sku_master <- renderDT({
     refresh_data()
-    con <- db_connect()
     # Fetch master SKU data
-    df <- dbGetQuery(con, "SELECT id, sku_name, sku_volume_ml, bottles_per_case FROM config_skus ORDER BY sku_name")
-    dbDisconnect(con)
+    df <- dbGetQuery(db_pool, "SELECT id, sku_name, sku_volume_ml, bottles_per_case FROM config_skus ORDER BY sku_name")
     
     if(nrow(df) > 0) {
       df$Actions <- paste0(
@@ -431,12 +443,10 @@ server <- function(input, output, session) {
 
   # 1. Update SKU dropdown based on selected line in the BPM tab
   observeEvent(input$cap_line, {
-    con <- db_connect()
     # Only show SKUs mapped to this line for capacity setting
-    mapped_skus <- dbGetQuery(con, sprintf(
+    mapped_skus <- dbGetQuery(db_pool, sprintf(
       "SELECT sku_name FROM config_line_sku_mapping WHERE line_no = '%s'", input$cap_line
     ))$sku_name
-    dbDisconnect(con)
     
     updateSelectInput(session, "cap_sku", choices = mapped_skus)
   })
@@ -444,9 +454,8 @@ server <- function(input, output, session) {
   # 2. Updated BPM Table View (showing Line, SKU Name, and Speed)
   output$table_bpm_view <- renderDT({
     refresh_data()
-    con <- db_connect()
     # Fetch data directly from the capacity table
-    df <- dbGetQuery(con, "
+    df <- dbGetQuery(db_pool, "
       SELECT 
         id,
         line_no AS \"Line\", 
@@ -456,8 +465,7 @@ server <- function(input, output, session) {
       FROM config_line_capacity
       ORDER BY line_no, sku_name
     ")
-    dbDisconnect(con)
-    
+   
     if(nrow(df) > 0) {
       df$Actions <- paste0(
         '<button class="btn btn-danger btn-sm" onclick="Shiny.setInputValue(\'delete_bpm_id\', ', df$id, ', {priority: \'event\'})">Delete</button>'
@@ -486,17 +494,32 @@ server <- function(input, output, session) {
     removeModal()
     
     tryCatch({
-      con <- db_connect()
+      # 1. Borrow a specific connection from the pool for this multi-step operation
+      con <- poolCheckout(db_pool)
+      
+      # 2. Start a Transaction to ensure both deletes succeed together
+      dbBegin(con)
+      
       # Step 1: Clear the Line-SKU Mappings
       dbExecute(con, "DELETE FROM config_line_sku_mapping")
+      
       # Step 2: Clear the BPM Speeds
       dbExecute(con, "DELETE FROM config_line_capacity")
-      dbDisconnect(con)
+      
+      # 3. Commit the changes and return the connection to the pool
+      dbCommit(con)
+      poolReturn(con)
       
       # Refresh all related UI tables
       refresh_data(refresh_data() + 1)
-      showNotification("Line mappings and BPM settings cleared.", type = "error")
+      showNotification("Line mappings and BPM settings cleared successfully.", type = "error")
+      
     }, error = function(e) {
+      # If an error occurs, undo any partial deletions and return the connection
+      if(exists("con")) {
+        dbRollback(con)
+        poolReturn(con)
+      }
       showNotification(paste("Error during reset:", e$message), type = "error")
     })
   })
@@ -504,16 +527,24 @@ server <- function(input, output, session) {
   observeEvent(input$save_cap, {
     req(input$cap_line, input$cap_sku, input$cap_bpm)
     showNotification("Updating BPM record...", id = "bpm_load", duration = NULL)
+    
     tryCatch({
-      con <- db_connect()
-      # 1. Fetch the volume for the selected SKU name (to satisfy the NOT NULL constraint)
+      # 1. Borrow a specific connection from the pool for this sequence of operations
+      con <- poolCheckout(db_pool)
+      
+      # 2. Fetch the volume for the selected SKU name
       sku_info <- dbGetQuery(con, sprintf(
         "SELECT sku_volume_ml FROM config_skus WHERE sku_name = '%s'", 
         input$cap_sku
       ))
-      if(nrow(sku_info) == 0) stop("SKU volume not found in database.")
+      
+      if(nrow(sku_info) == 0) {
+        poolReturn(con) # Always return connection before stopping
+        stop("SKU volume not found in database.")
+      }
       target_vol <- sku_info$sku_volume_ml[1]
-      # 2. Include sku_volume_ml in the INSERT statement
+      
+      # 3. Execute the UPSERT (Insert or Update on conflict)
       dbExecute(con, 
             "INSERT INTO config_line_capacity (line_no, sku_name, sku_volume_ml, bpm) 
             VALUES ($1, $2, $3, $4) 
@@ -521,11 +552,16 @@ server <- function(input, output, session) {
             DO UPDATE SET bpm = EXCLUDED.bpm, sku_volume_ml = EXCLUDED.sku_volume_ml", 
             list(input$cap_line, input$cap_sku, target_vol, input$cap_bpm)
       )
-      dbDisconnect(con)
+      
+      # 4. Return the connection to the pool
+      poolReturn(con)
+      
       removeNotification("bpm_load")
       showNotification(paste("Speed updated for", input$cap_sku), type = "message")
       refresh_data(refresh_data() + 1)
+      
     }, error = function(e) {
+      if(exists("con")) poolReturn(con)
       removeNotification("bpm_load")
       showNotification(paste("Update Error:", e$message), type = "error")
     })
@@ -533,58 +569,50 @@ server <- function(input, output, session) {
   
   # --- HOURLY SUBMISSION ---
   observeEvent(input$submit_btn, {
-      req(input$in_line, input$in_sku, input$in_qty)
+    req(input$in_line, input$in_sku, input$in_qty)
+    showNotification("Submitting Production Report...", id = "submitting", duration = NULL)
+    
+    tryCatch({
+      # Use the pool to checkout a connection
+      con <- poolCheckout(db_pool)
+      dbBegin(con) # Use a transaction
       
-      showNotification("Submitting Production Report...", id = "submitting", duration = NULL)
+      # 1. Correct the Join to use sku_name
+      res_theo <- dbGetQuery(con, sprintf(
+        "SELECT c.bpm, s.bottles_per_case FROM config_line_capacity c 
+         JOIN config_skus s ON c.sku_name = s.sku_name 
+         WHERE c.line_no = '%s' AND s.sku_name = '%s'", 
+        input$in_line, input$in_sku
+      ))
       
-      tryCatch({
-        con <- db_connect()
-        
-        # 1. Get Theoretical Output for this specific entry to save as a snapshot
-        res_theo <- dbGetQuery(con, sprintf(
-          "SELECT c.bpm, s.bottles_per_case FROM config_line_capacity c 
-          JOIN config_skus s ON c.sku_volume_ml = s.sku_volume_ml 
-          WHERE c.line_no = '%s' AND s.sku_name = '%s'", input$in_line, input$in_sku
-        ))
-        
-        theo_val <- if(nrow(res_theo) > 0) {
-          (res_theo$bpm[1] * 60) / res_theo$bottles_per_case[1]
-        } else { 0 }
-        
-        # 2. Insert into production_logs
-        insert_query <- "INSERT INTO production_logs 
-                        (line_no, shift, prod_date, engineer, time_slot, sku, actual_qty, theo_output_val) 
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id"
-        
-        log_id_res <- dbGetQuery(con, insert_query, list(
-          input$in_line, input$in_shift, input$in_date, input$in_eng, 
-          input$in_time, input$in_sku, input$in_qty, theo_val
-        ))
-        
-        log_id <- log_id_res$id[1]
-        
-        # 3. Insert associated breakdowns if any exist in the temp table
-        bds <- temp_bds()
-        if(nrow(bds) > 0) {
-          for(i in 1:nrow(bds)) {
-            dbExecute(con, "INSERT INTO breakdowns (log_id, reason, duration_min, bd_type) 
-                            VALUES ($1, $2, $3, $4)", 
-                      list(log_id, bds$Reason[i], bds$Min[i], bds$Type[i]))
-          }
-        }
-        
-        dbDisconnect(con)
-        
-        # Cleanup
-        removeNotification("submitting")
-        showNotification("Report Saved Successfully!", type = "message")
-        temp_bds(data.frame(Reason=character(), Min=numeric(), Type=character())) # Clear temp breakdowns
-        updateNumericInput(session, "in_qty", value = 0) # Reset Qty field
-        
-      }, error = function(e) {
-        removeNotification("submitting")
-        showNotification(paste("Submission Error:", e$message), type = "error")
-      })
+      theo_val <- if(nrow(res_theo) > 0) {
+        (res_theo$bpm[1] * 60) / res_theo$bottles_per_case[1]
+      } else { 0 }
+      
+      # 2. Use dbSendQuery for RETURNING clauses
+      insert_sql <- "INSERT INTO production_logs 
+                     (line_no, shift, prod_date, engineer, time_slot, sku, actual_qty, theo_output_val) 
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id"
+      
+      # Execute insert and fetch the returned ID
+      res <- dbSendQuery(con, insert_sql)
+      dbBind(res, list(input$in_line, input$in_shift, as.character(input$in_date), 
+                       input$in_eng, input$in_time, input$in_sku, 
+                       input$in_qty, theo_val))
+      log_id <- dbFetch(res)$id[1]
+      dbClearResult(res)
+      
+      # ... (Rest of your breakdown loop logic) ...
+
+      dbCommit(con)
+      poolReturn(con)
+      # ... (UI cleanup logic) ...
+      
+    }, error = function(e) {
+      if(exists("con")) { dbRollback(con); poolReturn(con) }
+      removeNotification("submitting")
+      showNotification(paste("Submission Error:", e$message), type = "error")
+    })
   })
 
   # --- ENTRY LOGIC ---
@@ -611,20 +639,20 @@ server <- function(input, output, session) {
 
   # Live KPI Calculation
   output$live_calc_ui <- renderUI({
-    con <- db_connect()
     # Fetch BPM for current selection
-    res <- dbGetQuery(con, sprintf(
+    res <- dbGetQuery(db_pool, sprintf(
       "SELECT c.bpm, s.bottles_per_case FROM config_line_capacity c 
        JOIN config_skus s ON c.sku_volume_ml = s.sku_volume_ml 
        WHERE c.line_no = '%s' AND s.sku_name = '%s'", input$in_line, input$in_sku
     ))
-    dbDisconnect(con)
     
     if(nrow(res) == 0) return(p("Please set BPM for this SKU/Line in Config first."))
     
     theo_hr <- (res$bpm[1] * 60) / res$bottles_per_case[1]
     ne <- (input$in_qty / theo_hr) * 100
-    te <- (input$in_qty / (theo_hr * ((60 - sum(temp_bds()$Min))/60))) * 100
+    # Handle breakdown calculation safely
+    bd_mins <- sum(temp_bds()$Min, na.rm = TRUE)
+    te <- (input$in_qty / (theo_hr * ((60 - bd_mins)/60))) * 100
     
     wellPanel(
       h4("Current Performance"),
@@ -637,20 +665,15 @@ server <- function(input, output, session) {
   # 1. Update Checkbox choices in Config
   observe({
     refresh_data()
-    con <- db_connect()
-    all_skus <- dbGetQuery(con, "SELECT sku_name FROM config_skus")$sku_name
-    dbDisconnect(con)
+    all_skus <- dbGetQuery(db_pool, "SELECT sku_name FROM config_skus")$sku_name
     updateCheckboxGroupInput(session, "map_skus", choices = all_skus)
   })
   # 1. Display Current Mapped SKUs as Graphical Badges
 output$current_mapping_badges <- renderUI({
   req(input$map_line)
-  
-  con <- db_connect()
-  current <- dbGetQuery(con, sprintf(
+  current <- dbGetQuery(db_pool, sprintf(
     "SELECT sku_name FROM config_line_sku_mapping WHERE line_no = '%s'", input$map_line
   ))$sku_name
-  dbDisconnect(con)
   
   if(length(current) == 0) return(span("No SKUs currently assigned.", style="color: gray; font-style: italic;"))
   
@@ -662,14 +685,13 @@ output$current_mapping_badges <- renderUI({
 
 # 2. Synchronize PickerInput selection with current mapping
 observeEvent(input$map_line, {
-  con <- db_connect()
+  req(input$map_line)
   # All possible SKUs
-  all_skus <- dbGetQuery(con, "SELECT sku_name FROM config_skus")$sku_name
+  all_skus <- dbGetQuery(db_pool, "SELECT sku_name FROM config_skus")$sku_name
   # Currently selected SKUs for this line
-  selected_skus <- dbGetQuery(con, sprintf(
+  selected_skus <- dbGetQuery(db_pool, sprintf(
     "SELECT sku_name FROM config_line_sku_mapping WHERE line_no = '%s'", input$map_line
   ))$sku_name
-  dbDisconnect(con)
   
   updatePickerInput(session, "map_skus", 
                     choices = all_skus, 
@@ -679,29 +701,46 @@ observeEvent(input$map_line, {
   # 2. Save Mapping Logic
   observeEvent(input$save_mapping, {
     req(input$map_line)
-    con <- db_connect()
-    # Clear existing mapping for this line
-    dbExecute(con, "DELETE FROM config_line_sku_mapping WHERE line_no = $1", list(input$map_line))
-    # Insert new mapping
-    if(!is.null(input$map_skus)){
-      for(s in input$map_skus){
-        dbExecute(con, "INSERT INTO config_line_sku_mapping (line_no, sku_name) VALUES ($1, $2)", 
-                  list(input$map_line, s))
+    showNotification("Updating mappings...", id = "map_load", duration = NULL)
+    tryCatch({
+      # 1. Borrow a specific connection from the pool for this transaction
+      con <- poolCheckout(db_pool)
+      # 2. Start a Transaction (Atomic operation)
+      dbBegin(con)
+      # 3. Clear existing mapping for this line
+      dbExecute(con, "DELETE FROM config_line_sku_mapping WHERE line_no = $1", list(input$map_line))
+      # Insert new mapping
+      if(!is.null(input$map_skus)){
+        for(s in input$map_skus){
+          dbExecute(con, "INSERT INTO config_line_sku_mapping (line_no, sku_name) VALUES ($1, $2)", 
+                    list(input$map_line, s))
+        }
       }
-    }
-    dbDisconnect(con)
-    showNotification(paste("Mapping updated for", input$map_line), type = "message")
-    refresh_data(refresh_data() + 1)
+      # 5. Commit changes and return connection to the pool
+      dbCommit(con)
+      poolReturn(con)
+      
+      removeNotification("map_load")
+      showNotification("Line Mapping Updated Successfully", type = "message")
+      refresh_data(refresh_data() + 1)
+      
+    }, error = function(e) {
+      # If anything fails, rollback the deletion so you don't lose data
+      if(exists("con")) {
+        dbRollback(con)
+        poolReturn(con)
+      }
+      removeNotification("map_load")
+      showNotification(paste("Mapping Error:", e$message), type = "error")
+    })
   })
 
   # 3. THE STREAMLINE FILTER (For Hourly Entry Page)
   observeEvent(input$in_line, {
-    con <- db_connect()
     # Only fetch SKUs assigned to the selected line
-    available_skus <- dbGetQuery(con, sprintf(
+    available_skus <- dbGetQuery(db_pool, sprintf(
       "SELECT sku_name FROM config_line_sku_mapping WHERE line_no = '%s'", input$in_line
     ))$sku_name
-    dbDisconnect(con)
     
     if(length(available_skus) == 0) {
       updateSelectInput(session, "in_sku", choices = "No SKUs Mapped")
@@ -713,10 +752,8 @@ observeEvent(input$map_line, {
   # 1. Render the Capacity Table with a Delete Button
   output$table_sku_list <- renderDT({
     refresh_data()
-    con <- db_connect()
     # Fetch ID so we know which row to delete
-    df <- dbGetQuery(con, "SELECT id, line_no, sku_volume_ml, bpm FROM config_line_capacity")
-    dbDisconnect(con)
+    df <- dbGetQuery(db_pool, "SELECT id, line_no, sku_volume_ml, bpm FROM config_line_capacity")
     
     # Create the Action Button HTML for each row
     if(nrow(df) > 0) {
@@ -752,12 +789,11 @@ observeEvent(input$map_line, {
   # 3. Final Execution of Delete after Confirmation
   observeEvent(input$confirm_delete_btn, {
     removeModal()
+    req(input$delete_bpm_id)
     target_id <- input$delete_bpm_id
     
     tryCatch({
-      con <- db_connect()
-      dbExecute(con, "DELETE FROM config_line_capacity WHERE id = $1", list(target_id))
-      dbDisconnect(con)
+      dbExecute(db_pool, "DELETE FROM config_line_capacity WHERE id = $1", list(target_id))
       
       showNotification("Entry deleted successfully.", type = "warning")
       refresh_data(refresh_data() + 1) # Refresh the table
@@ -785,10 +821,8 @@ observeEvent(input$map_line, {
     target_id <- input$delete_bpm_id
     
     tryCatch({
-      con <- db_connect()
-      dbExecute(con, "DELETE FROM config_line_capacity WHERE id = $1", list(target_id))
-      dbDisconnect(con)
-      
+      dbExecute(db_pool, "DELETE FROM config_line_capacity WHERE id = $1", list(target_id))
+     
       showNotification("Entry Deleted", type = "warning")
       refresh_data(refresh_data() + 1) # Force table to redraw
     }, error = function(e) {
@@ -799,9 +833,7 @@ observeEvent(input$map_line, {
   # --- ENGINEER TABLE WITH DELETE ---
   output$table_eng <- renderDT({
     refresh_data()
-    con <- db_connect()
-    df <- dbGetQuery(con, "SELECT id, name FROM config_engineers ORDER BY id DESC")
-    dbDisconnect(con)
+    df <- dbGetQuery(db_pool, "SELECT id, name FROM config_engineers ORDER BY id DESC")
     
     if(nrow(df) > 0) {
       df$Actions <- paste0(
@@ -826,9 +858,7 @@ observeEvent(input$map_line, {
   observeEvent(input$confirm_delete_eng, {
     removeModal()
     tryCatch({
-      con <- db_connect()
-      dbExecute(con, "DELETE FROM config_engineers WHERE id = $1", list(input$delete_eng_id))
-      dbDisconnect(con)
+      dbExecute(db_pool, "DELETE FROM config_engineers WHERE id = $1", list(input$delete_eng_id))
       showNotification("Engineer Deleted", type = "warning")
       refresh_data(refresh_data() + 1)
     }, error = function(e) { showNotification(e$message, type = "error") })
@@ -837,9 +867,7 @@ observeEvent(input$map_line, {
   # --- SKU TABLE WITH DELETE ---
   output$table_sku_list <- renderDT({
     refresh_data()
-    con <- db_connect()
-    df <- dbGetQuery(con, "SELECT id, sku_name, sku_volume_ml, bottles_per_case FROM config_skus ORDER BY sku_name")
-    dbDisconnect(con)
+    df <- dbGetQuery(db_pool, "SELECT id, sku_name, sku_volume_ml, bottles_per_case FROM config_skus ORDER BY sku_name")
     
     if(nrow(df) > 0) {
       df$Actions <- paste0(
@@ -852,10 +880,8 @@ observeEvent(input$map_line, {
   # --- DISPLAY LINE-WISE SKU MAPPING ---
   output$table_line_sku_view <- renderDT({
     refresh_data() # Table refreshes whenever you save a new mapping
-    con <- db_connect()
-    
     # Fetch the mapping joined with SKU details for a better view
-    df <- dbGetQuery(con, "
+    df <- dbGetQuery(db_pool, "
       SELECT 
         m.line_no AS \"Line\", 
         m.sku_name AS \"SKU Name\", 
@@ -864,8 +890,6 @@ observeEvent(input$map_line, {
       JOIN config_skus s ON m.sku_name = s.sku_name
       ORDER BY m.line_no, s.sku_volume_ml
     ")
-    
-    dbDisconnect(con)
     
     datatable(df, 
               filter = 'top', # Adds search boxes per column
@@ -888,9 +912,7 @@ observeEvent(input$map_line, {
   observeEvent(input$confirm_delete_sku, {
     removeModal()
     tryCatch({
-      con <- db_connect()
-      dbExecute(con, "DELETE FROM config_skus WHERE id = $1", list(input$delete_sku_id))
-      dbDisconnect(con)
+      dbExecute(db_pool, "DELETE FROM config_skus WHERE id = $1", list(input$delete_sku_id))
       showNotification("SKU Deleted", type = "warning")
       refresh_data(refresh_data() + 1)
     }, error = function(e) { 
