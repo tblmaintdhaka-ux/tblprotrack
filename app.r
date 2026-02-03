@@ -10,8 +10,6 @@ library(shinyjs)
 library(pool) #
 
 # --- 1. PERSISTENT DATABASE POOL ---
-# Initialize the pool outside the server function so it's shared across sessions
-# but maintained by the R process.
 db_pool <- dbPool(
   RPostgres::Postgres(),
   dbname   = 'postgres',
@@ -25,11 +23,11 @@ onStop(function() {
 })
 
 # --- 2. UI STRUCTURE ---
-# Main Application UI (Hidden until login)
 ui_main_app <- function(role) {
   navbarPage(
     title = "ProTrack Manufacturing",
     theme = bs_theme(bootswatch = "flatly", primary = "#2c3e50"),
+  
   
   # DASHBOARD PAGE
   tabPanel("Dashboard",
@@ -59,7 +57,7 @@ ui_main_app <- function(role) {
         h4("Production Data"),
         selectInput("in_time", "Time Duration:", choices = NULL),
         selectInput("in_sku", "SKU Name:", choices = NULL),
-        numericInput("in_qty", "Actual Production (Cases):", value = 0),
+        numericInput("qty_debounced()", "Actual Production (Cases):", value = 0),
         actionButton("submit_btn", "Submit Hourly Report", class = "btn-success", width = "100%")
       ),
       mainPanel(
@@ -128,7 +126,7 @@ ui_main_app <- function(role) {
             ),
             column(8,
               h5("Currently Mapped SKUs:"),
-              uiOutput("current_mapping_badges") # Graphical display of existing setup
+              uiOutput("current_mapping_badges") 
             )
           ),
           hr(),
@@ -137,7 +135,7 @@ ui_main_app <- function(role) {
               pickerInput(
                 inputId = "map_skus",
                 label = "Select Available SKUs for this Line:",
-                choices = NULL, # Filled by server
+                choices = NULL, 
                 multiple = TRUE,
                 options = pickerOptions(
                   actionsBox = TRUE, 
@@ -162,7 +160,7 @@ ui_main_app <- function(role) {
           fluidRow(
             column(4, selectInput("cap_line", "Select Line", 
                                   choices = c("Line-1", "Line-2", "Line-3", "Line-4", "Line-5", "Line-6"))),
-            column(4, selectInput("cap_sku", "Select SKU", choices = NULL)), # Filtered SKU list
+            column(4, selectInput("cap_sku", "Select SKU", choices = NULL)), 
             column(4, numericInput("cap_bpm", "BPM (Speed)", 0))
           ),
           actionButton("save_cap", "Update BPM", class = "btn-success")
@@ -174,7 +172,6 @@ ui_main_app <- function(role) {
     )
   ),
 
-    # Add a logout button in the navbar
     header = tags$div(style="position: absolute; right: 20px; top: 10px; z-index: 1000;", 
                       actionButton("logout_btn", "Logout", class="btn-sm btn-outline-danger"))
   )
@@ -198,11 +195,81 @@ server <- function(input, output, session) {
   is_editing_user <- reactiveVal(NULL)
   temp_bds <- reactiveVal(data.frame(Reason=character(), Min=numeric(), Type=character()))
 
+  # --- CENTRALIZED DASHBOARD DATA (CACHED) ---
+  dash_metrics <- reactive({
+    refresh_data() 
+    query <- "
+      SELECT 
+        COUNT(DISTINCT line_no) as active_lines,
+        SUM(actual_qty) as total_cases,
+        AVG(CASE WHEN theo_output_val > 0 THEN (actual_qty / theo_output_val) * 100 END) as avg_ne,
+        AVG(CASE WHEN theo_output_val > 0 THEN (actual_qty / (theo_output_val * 0.85)) * 100 END) as avg_te
+      FROM production_logs 
+      WHERE prod_date = CURRENT_DATE
+    "
+    dbGetQuery(db_pool, query)
+  }) %>% bindCache(refresh_data())
+
+  # --- DASHBOARD OUTPUTS (Using bslib value_box) ---
+  output$dash_total_cases <- renderUI({
+    val <- dash_metrics()$total_cases[1]
+    value_box(
+      title = "Total Cases (Today)",
+      value = if(is.na(val)) 0 else format(val, big.mark=","),
+      showcase = icon("box"),
+      theme = "primary"
+    )
+  })
+
+  output$dash_avg_ne <- renderUI({
+    val <- dash_metrics()$avg_ne[1]
+    value_box(
+      title = "Avg NE%",
+      value = paste0(if(is.na(val)) 0 else round(val, 1), "%"),
+      showcase = icon("chart-line"),
+      theme = "info"
+    )
+  })
+
+  output$dash_avg_te <- renderUI({
+    val <- dash_metrics()$avg_te[1]
+    value_box(
+      title = "Avg TE%",
+      value = paste0(if(is.na(val)) 0 else round(val, 1), "%"),
+      showcase = icon("gauge-high"),
+      theme = "success"
+    )
+  })
+
+  output$dash_active_lines <- renderUI({
+    val <- dash_metrics()$active_lines[1]
+    value_box(
+      title = "Active Lines",
+      value = if(is.na(val)) 0 else val,
+      showcase = icon("industry"),
+      theme = "secondary"
+    )
+  })
+
+  # --- TREND PLOT (CACHED) ---
+  output$daily_trend_plot <- renderCachedPlot({
+    refresh_data()
+    df <- dbGetQuery(db_pool, "
+      SELECT prod_date, SUM(actual_qty) as daily_total 
+      FROM production_logs 
+      GROUP BY prod_date ORDER BY prod_date DESC LIMIT 14
+    ")
+    
+    ggplot(df, aes(x = as.Date(prod_date), y = daily_total)) +
+      geom_area(fill = "#2c3e50", alpha = 0.2) +
+      geom_line(color = "#2c3e50", size = 1) +
+      theme_minimal() +
+      labs(title = "14-Day Production Trend", x = "Date", y = "Total Cases")
+  }, cacheKeyExpr = { list(refresh_data()) })
+
   # 1. LOGIN UI GATEKEEPER
   output$page_content <- renderUI({
-    # We create a local dependency on auth$logged_in
     if (!auth$logged_in) {
-      # Show Login Screen
       tagList(
         fluidRow(
           column(4, offset = 4, style = "margin-top: 100px;",
@@ -216,14 +283,12 @@ server <- function(input, output, session) {
         )
       )
     } else {
-      # Show Main App
       ui_main_app(auth$role)
     }
   })
 
   # 2. LOGIN AUTHENTICATION
   observeEvent(input$login_btn, {
-    # Use the pool directly instead of db_connect()
     user_data <- dbGetQuery(db_pool, sprintf(
           "SELECT username, role FROM app_users WHERE username = '%s' AND password = '%s'",
       input$login_user, input$login_pass
@@ -241,7 +306,6 @@ server <- function(input, output, session) {
 
   # --- LOGOUT LOGIC ---
   observeEvent(input$logout_btn, {
-    # 1. Close any open modals
     removeModal()
     
     # 2. Reset local reactive states (Clean up R side)
@@ -269,7 +333,7 @@ server <- function(input, output, session) {
     }
     datatable(df, escape = FALSE, selection = 'none',
               colnames = c("ID", "Username", "Role", "Actions"))
-  })
+  },server = TRUE)
 
   # User Edit Logic (Administrator Function)
   observeEvent(input$edit_user_id, {
@@ -372,8 +436,16 @@ server <- function(input, output, session) {
   refresh_cfg <- reactiveVal(0)
   temp_bds <- reactiveVal(data.frame(Reason=character(), Min=numeric(), Type=character()))
 
-
   # --- CONFIGURATION LOGIC ---
+  cached_config <- reactive({
+    refresh_cfg()
+    list(
+      engs = dbGetQuery(db_pool, "SELECT name FROM config_engineers")$name,
+      skus = dbGetQuery(db_pool, "SELECT sku_name FROM config_skus")$sku_name,
+      vols <- dbGetQuery(db_pool, "SELECT DISTINCT sku_volume_ml FROM config_skus")$sku_volume_ml
+    )
+  }) %>% bindCache(refresh_cfg())
+
   observe({
     refresh_cfg()
     refresh_data()
@@ -439,7 +511,7 @@ server <- function(input, output, session) {
     }
     datatable(df, escape = FALSE, selection = 'none', 
               colnames = c("ID", "SKU Name", "Volume (ml)", "BPC", "Actions"))
-  })
+  },server = TRUE)
 
   # 1. Update SKU dropdown based on selected line in the BPM tab
   observeEvent(input$cap_line, {
@@ -472,7 +544,7 @@ server <- function(input, output, session) {
       )
     }
     datatable(df, escape = FALSE, selection = 'none', options = list(pageLength = 10))
-  })
+  }, server = TRUE)
 
   # 1. Confirmation Modal for Reset
   observeEvent(input$reset_all_config, {
@@ -569,7 +641,7 @@ server <- function(input, output, session) {
   
   # --- HOURLY SUBMISSION ---
   observeEvent(input$submit_btn, {
-    req(input$in_line, input$in_sku, input$in_qty)
+    req(input$in_line, input$in_sku, input$qty_debounced())
     showNotification("Submitting Production Report...", id = "submitting", duration = NULL)
     
     tryCatch({
@@ -598,7 +670,7 @@ server <- function(input, output, session) {
       res <- dbSendQuery(con, insert_sql)
       dbBind(res, list(input$in_line, input$in_shift, as.character(input$in_date), 
                        input$in_eng, input$in_time, input$in_sku, 
-                       input$in_qty, theo_val))
+                       input$qty_debounced(), theo_val))
       log_id <- dbFetch(res)$id[1]
       dbClearResult(res)
       
@@ -637,8 +709,11 @@ server <- function(input, output, session) {
   
   output$temp_bd_list <- renderTable({ temp_bds() })
 
+  # 1. Create a debounced version of the quantity input
+  qty_debounced <- reactive({ input$in_qty }) %>% debounce(500)
   # Live KPI Calculation
   output$live_calc_ui <- renderUI({
+    req(input$in_line, input$in_sku, qty_debounced())
     # Fetch BPM for current selection
     res <- dbGetQuery(db_pool, sprintf(
       "SELECT c.bpm, s.bottles_per_case FROM config_line_capacity c 
@@ -649,10 +724,10 @@ server <- function(input, output, session) {
     if(nrow(res) == 0) return(p("Please set BPM for this SKU/Line in Config first."))
     
     theo_hr <- (res$bpm[1] * 60) / res$bottles_per_case[1]
-    ne <- (input$in_qty / theo_hr) * 100
+    ne <- (qty_debounced() / theo_hr) * 100
     # Handle breakdown calculation safely
     bd_mins <- sum(temp_bds()$Min, na.rm = TRUE)
-    te <- (input$in_qty / (theo_hr * ((60 - bd_mins)/60))) * 100
+    te <- (qty_debounced() / (theo_hr * ((60 - bd_mins)/60))) * 100
     
     wellPanel(
       h4("Current Performance"),
@@ -660,7 +735,7 @@ server <- function(input, output, session) {
       p(paste("NE%:", round(ne, 1), "%")),
       p(paste("TE%:", round(te, 1), "%"))
     )
-  })
+  }) %>% bindCache(input$in_line, input$in_sku, temp_bds())
 
   # 1. Update Checkbox choices in Config
   observe({
@@ -769,7 +844,7 @@ observeEvent(input$map_line, {
               escape = FALSE, 
               selection = 'none', 
               options = list(pageLength = 10, columnDefs = list(list(className = 'dt-center', targets = "_all"))))
-  })
+  },server = TRUE)
 
   # 2. Logic to handle the Deletion when a button is clicked
   observeEvent(input$delete_bpm_id, {
@@ -841,7 +916,7 @@ observeEvent(input$map_line, {
       )
     }
     datatable(df, escape = FALSE, selection = 'none')
-  })
+  },server = TRUE)
 
   # Engineer Delete Observer
   observeEvent(input$delete_eng_id, {
@@ -875,7 +950,7 @@ observeEvent(input$map_line, {
       )
     }
     datatable(df, escape = FALSE, selection = 'none')
-  })
+  },server = TRUE)
 
   # --- DISPLAY LINE-WISE SKU MAPPING ---
   output$table_line_sku_view <- renderDT({
@@ -895,7 +970,7 @@ observeEvent(input$map_line, {
               filter = 'top', # Adds search boxes per column
               options = list(pageLength = 10, autoWidth = TRUE),
               rownames = FALSE)
-  })
+  },server = TRUE)
 
   # SKU Delete Observer
   observeEvent(input$delete_sku_id, {
