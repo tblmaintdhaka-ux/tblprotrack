@@ -24,157 +24,245 @@ onStop(function() {
 
 # --- 2. UI STRUCTURE ---
 ui_main_app <- function(role) {
-  navbarPage(
-    title = "ProTrack Manufacturing",
-    theme = bs_theme(bootswatch = "flatly", primary = "#2c3e50"),
-  
-  
-  # DASHBOARD PAGE
-  tabPanel("Dashboard",
-    fluidRow(
-      column(3, uiOutput("dash_total_cases")),
-      column(3, uiOutput("dash_avg_ne")),
-      column(3, uiOutput("dash_avg_te")),
-      column(3, uiOutput("dash_active_lines"))
-    ),
-    hr(),
-    fluidRow(
-      column(8, plotOutput("daily_trend_plot")),
-      column(4, h4("Last Hour Status"), DTOutput("status_table_mini"))
-    )
-  ),
-  
-  # HOURLY ENTRY PAGE
-  tabPanel("Hourly Entry",
-    sidebarLayout(
-      sidebarPanel(
-        h4("Shift Header"),
-        selectInput("in_line", "Line:", choices = c("Line-1", "Line-2", "Line-3", "Line-4", "Line-5", "Line-6")),
-        selectInput("in_shift", "Shift:", choices = c("A", "B", "C")),
-        dateInput("in_date", "Date:", value = Sys.Date()),
-        selectInput("in_eng", "Shift Engineer:", choices = NULL),
-        hr(),
-        h4("Production Data"),
-        selectInput("in_time", "Time Duration:", choices = NULL),
-        selectInput("in_sku", "SKU Name:", choices = NULL),
-        numericInput("qty_debounced()", "Actual Production (Cases):", value = 0),
-        actionButton("submit_btn", "Submit Hourly Report", class = "btn-success", width = "100%")
+  tagList(
+    useShinyjs(),
+    navbarPage(
+      title = "ProTrack Manufacturing",
+      theme = bs_theme(bootswatch = "flatly", primary = "#2c3e50"),
+    
+    
+    # DASHBOARD PAGE
+    tabPanel("Dashboard",
+      fluidRow(
+        column(3, uiOutput("dash_total_cases")),
+        column(3, uiOutput("dash_avg_ne")),
+        column(3, uiOutput("dash_avg_te")),
+        column(3, uiOutput("dash_active_lines"))
       ),
-      mainPanel(
-        h4("Breakdowns in this Hour"),
-        fluidRow(
-          column(4, textInput("bd_rsn", "Reason")),
-          column(3, numericInput("bd_min", "Min", 0)),
-          column(5, selectInput("bd_tp", "Type", choices = c("ChangeOver", "Operational", "Maintenance")))
-        ),
-        actionButton("add_bd", "Add Breakdown", class = "btn-info"),
-        tableOutput("temp_bd_list"),
-        hr(),
-        uiOutput("live_calc_ui")
+      hr(),
+      fluidRow(
+        column(8, plotOutput("daily_trend_plot")),
+        column(4, h4("Last Hour Status"), DTOutput("status_table_mini"))
       )
-    )
-  ),
-  # PAGE 3: REPORTS
-  tabPanel("Reports",
-           fluidRow(
-             column(4, dateRangeInput("rep_date", "Select Range:", start = Sys.Date()-7, end = Sys.Date())),
-             column(4, selectInput("rep_line", "Line:", choices = c("All", "Line-1", "Line-2", "Line-3", "Line-4", "Line-5", "Line-6")))
-           ),
-           DTOutput("full_report_table")
-  ),
-
-  # CONFIGURATION PAGE
-  tabPanel("Configuration",
-    navlistPanel(
-      # Admin Only: User Management
-      if(role == "Admin") tabPanel("User Management", 
-        wellPanel(
-          h4("User Administration"),
-          fluidRow(
-            column(4, textInput("new_u_name", "Username")),
-            column(4, textInput("new_u_pass", "Password")),
-            column(4, selectInput("new_u_role", "Role", choices = c("Engineer", "Admin")))
-          ),
-          actionButton("save_user", "Create/Update User", class = "btn-success")
+    ),
+    
+    # HOURLY ENTRY PAGE
+    tabPanel("Hourly Entry",
+      sidebarLayout(
+        sidebarPanel(
+          h4("Shift Header"),
+          selectInput("in_line", "Line:", choices = c("Line-1", "Line-2", "Line-3", "Line-4", "Line-5", "Line-6")),
+          selectInput("in_shift", "Shift:", choices = c("A", "B", "C")),
+          dateInput("in_date", "Date:", value = Sys.Date()),
+          selectInput("in_eng", "Shift Engineer:", choices = NULL),
+          hr(),
+          h4("Production Data"),
+          selectInput("in_time", "Time Duration:", choices = NULL),
+          selectInput("in_sku", "SKU Name:", choices = NULL),
+          numericInput("in_qty", "Actual Production (Cases):", value = 0),
+          actionButton("submit_btn", "Submit Hourly Report", class = "btn-success", width = "100%")
         ),
-        DTOutput("table_users")
-      ),
-      tabPanel("Engineers Database",
-        textInput("new_eng", "Engineer Name:"),
-        actionButton("save_eng", "Add Engineer"),
-        DTOutput("table_eng")
-      ),
-      tabPanel("SKU Database",
-        wellPanel(
-          h4("Manage SKU Master Data"),
+        mainPanel(
+          h4("Breakdowns in this Hour"),
           fluidRow(
-            column(4, textInput("sku_n", "SKU Name")),
-            column(4, numericInput("sku_v", "Volume (ml)", 250)),
-            column(4, numericInput("sku_bpc", "Bottles/Case", 12))
+            column(4, selectInput("bd_machine", "Machine", choices = NULL)), # Populated by server
+            column(4, selectizeInput(
+              inputId = "bd_rsn", 
+              label = "Reason", 
+              choices = NULL, # Populated dynamically from DB
+              options = list(
+                placeholder = 'Type or select reason...',
+                create = TRUE,       # Allows typing a brand new reason
+                maxOptions = 10,     # Keeps the list manageable
+                openOnFocus = TRUE   # Shows suggestions immediately on click
+              )
+            )),
+            column(4, selectInput("bd_tp", "Type", choices = c("Operational", "Maintenance", "ChangeOver", "Utility")))
           ),
-          actionButton("save_sku", "Save SKU", class = "btn-primary")
-        ),
-        DTOutput("table_sku_master")
-      ),
-      tabPanel("Line-SKU Mapping",
-        wellPanel(
-          h4("Streamline Line Capacity"),
           fluidRow(
-            column(4, 
-              selectInput("map_line", "Select Line", 
-                          choices = c("Line-1", "Line-2", "Line-3", "Line-4", "Line-5", "Line-6"))
-            ),
-            column(8,
-              h5("Currently Mapped SKUs:"),
-              uiOutput("current_mapping_badges") 
-            )
+            column(3, numericInput("bd_min", "Duration (Min)", 0, min = 0)),
+            column(2, actionButton("add_bd", "+", class = "btn-info", style = "margin-top: 25px;")),
+            column(7, checkboxInput("no_bd", "No Breakdown for this hour", value = FALSE))
           ),
           hr(),
-          fluidRow(
-            column(12,
-              pickerInput(
-                inputId = "map_skus",
-                label = "Select Available SKUs for this Line:",
-                choices = NULL, 
-                multiple = TRUE,
-                options = pickerOptions(
-                  actionsBox = TRUE, 
-                  liveSearch = TRUE,
-                  selectedTextFormat = "count > 3",
-                  noneSelectedText = "No SKUs Assigned"
+          h4("Staged Breakdowns"),
+          tableOutput("temp_bd_list"),
+          hr(),
+          uiOutput("live_calc_ui")
+        )
+      )
+    ),
+    tabPanel("Shift Data Check",
+      tabsetPanel(
+        tabPanel("Production & Breakdowns",
+          fluidPage(
+            h3("Last Shift Review (Coordinator View)"),
+            wellPanel(
+              fluidRow(
+                column(6, 
+                  actionButton("refresh_check", "Refresh Data", icon = icon("sync")),
+                  actionButton("finalize_shift", "Finalize & Save All", class = "btn-success", icon = icon("check-double"))
                 ),
-                width = "100%"
+                column(6, align = "right",
+                  downloadButton("download_shift_pdf", "Download PDF Summary", class = "btn-danger")
+                )
               )
+            ),
+            h4("1. Production Quantities"),
+            DTOutput("table_shift_check"),
+            hr(),
+            h4("2. Breakdown Records"),
+            DTOutput("table_breakdown_check")
+          )
+        ),
+        tabPanel("Material & Utility Usage",
+          fluidPage(
+            h4("Shift Material Usage"),
+            wellPanel(
+              fluidRow(
+                column(4, numericInput("mat_preform", "Preform Usage (pcs)", 0)),
+                column(4, numericInput("mat_closure", "Closure Usage (pcs)", 0)),
+                column(4, numericInput("mat_syrup", "Syrup Usage (Liter)", 0, step = 0.1))
+              ),
+              fluidRow(
+                column(4, numericInput("mat_label", "Label Usage (KG)", 0, step = 0.01)),
+                column(4, numericInput("mat_co2", "CO2 Usage (Kg)", 0, step = 0.1)),
+                column(4, numericInput("mat_fill_err", "High/Low Fill (pcs)", 0))
+              ),
+              actionButton("save_materials", "Save Material Usage", class = "btn-primary")
+            ),
+            hr(),
+            h4("Daily Power Usage (24 Hours)"),
+            wellPanel(
+              fluidRow(
+                column(6, dateInput("power_date", "Date", value = Sys.Date())),
+                column(6, numericInput("power_kwh", "Power Usage (KWH)", 0, step = 1))
+              ),
+              actionButton("save_power", "Save Power Record", class = "btn-warning"),
+              p(style = "color: gray; margin-top: 10px;", 
+                "Note: Only one power record is required per day for yield/efficiency calculation.")
             )
-          ),
-          actionButton("save_mapping", "Update Line Mapping", class = "btn-warning"),
-          actionButton("reset_all_config", "Reset All Line Configurations", 
-                      class = "btn-danger", icon = icon("trash-alt"), style = "margin-left: 10px;")
-        ),
-        hr(),
-        DTOutput("table_line_sku_view")
-      ),
-            tabPanel("Line Capacity (BPM)",
-        wellPanel(
-          h4("Record Line Speeds"),
-          fluidRow(
-            column(4, selectInput("cap_line", "Select Line", 
-                                  choices = c("Line-1", "Line-2", "Line-3", "Line-4", "Line-5", "Line-6"))),
-            column(4, selectInput("cap_sku", "Select SKU", choices = NULL)), 
-            column(4, numericInput("cap_bpm", "BPM (Speed)", 0))
-          ),
-          actionButton("save_cap", "Update BPM", class = "btn-success")
-        ),
-        hr(),
-        h4("Current Line Speeds per SKU"),
-        DTOutput("table_bpm_view")
-      ),
-    )
-  ),
+          )
+        )
+      )
+    ),
+    # PAGE 3: REPORTS
+    tabPanel("Reports",
+            fluidRow(
+              column(4, dateRangeInput("rep_date", "Select Range:", start = Sys.Date()-7, end = Sys.Date())),
+              column(4, selectInput("rep_line", "Line:", choices = c("All", "Line-1", "Line-2", "Line-3", "Line-4", "Line-5", "Line-6")))
+            ),
+            DTOutput("full_report_table")
+    ),
 
-    header = tags$div(style="position: absolute; right: 20px; top: 10px; z-index: 1000;", 
-                      actionButton("logout_btn", "Logout", class="btn-sm btn-outline-danger"))
-  )
+    # CONFIGURATION PAGE
+    tabPanel("Configuration",
+      navlistPanel(
+        # Admin Only: User Management
+        if(role == "Admin") tabPanel("User Management", 
+          wellPanel(
+            h4("User Administration"),
+            fluidRow(
+              column(4, textInput("new_u_name", "Username")),
+              column(4, textInput("new_u_pass", "Password")),
+              column(4, selectInput("new_u_role", "Role", choices = c("Engineer", "Admin")))
+            ),
+            actionButton("save_user", "Create/Update User", class = "btn-success")
+          ),
+          DTOutput("table_users")
+        ),
+        tabPanel("Engineers Database",
+          textInput("new_eng", "Engineer Name:"),
+          actionButton("save_eng", "Add Engineer"),
+          DTOutput("table_eng")
+        ),
+        tabPanel("Machine Database",
+          wellPanel(
+            h4("Manage Line Machines"),
+            fluidRow(
+              column(4, selectInput("m_line", "Select Line", choices = c("Line-1", "Line-2", "Line-3", "Line-4", "Line-5", "Line-6"))),
+              column(6, textInput("m_name", "Machine Name (e.g., Filler, Labeller)")),
+              column(2, actionButton("save_machine", "Add", class = "btn-success", style = "margin-top: 25px;"))
+            ),
+            hr(),
+            DTOutput("table_machines")
+          )
+        ),
+        tabPanel("SKU Database",
+          wellPanel(
+            h4("Manage SKU Master Data"),
+            fluidRow(
+              column(4, textInput("sku_n", "SKU Name")),
+              column(4, numericInput("sku_v", "Volume (ml)", 250)),
+              column(4, numericInput("sku_bpc", "Bottles/Case", 12))
+            ),
+            actionButton("save_sku", "Save SKU", class = "btn-primary")
+          ),
+          DTOutput("table_sku_master")
+        ),
+        tabPanel("Line-SKU Mapping",
+          wellPanel(
+            h4("Streamline Line Capacity"),
+            fluidRow(
+              column(4, 
+                selectInput("map_line", "Select Line", 
+                            choices = c("Line-1", "Line-2", "Line-3", "Line-4", "Line-5", "Line-6"))
+              ),
+              column(8,
+                h5("Currently Mapped SKUs:"),
+                uiOutput("current_mapping_badges") 
+              )
+            ),
+            hr(),
+            fluidRow(
+              column(12,
+                selectizeInput(
+                  inputId = "map_skus",
+                  label = "Select Available SKUs for this Line:",
+                  choices = NULL,
+                  multiple = TRUE,
+                  width = "100%",
+                  options = list(
+                    placeholder = 'No SKUs Assigned - Select Line First',
+                    plugins = list('remove_button')
+                  )
+                )
+              )
+            ),
+            fluidRow(
+              column(12, style = "margin-bottom: 10px;",
+                actionButton("select_all_skus", "Select All", class = "btn-sm btn-default"),
+                actionButton("deselect_all_skus", "Clear All", class = "btn-sm btn-default")
+              )
+            ),
+            actionButton("save_mapping", "Update Line Mapping", class = "btn-warning"),
+            actionButton("reset_all_config", "Reset All Line Configurations", 
+                        class = "btn-danger", icon = icon("trash-alt"), style = "margin-left: 10px;")
+          ),
+          hr(),
+          DTOutput("table_line_sku_view")
+        ),
+        tabPanel("Line Capacity (BPM)",
+          wellPanel(
+            h4("Record Line Speeds"),
+            fluidRow(
+              column(4, selectInput("cap_line", "Select Line", 
+                                    choices = c("Line-1", "Line-2", "Line-3", "Line-4", "Line-5", "Line-6"))),
+              column(4, selectInput("cap_sku", "Select SKU", choices = NULL)), 
+              column(4, numericInput("cap_bpm", "BPM (Speed)", 0))
+            ),
+            actionButton("save_cap", "Update BPM", class = "btn-success")
+          ),
+          hr(),
+          h4("Current Line Speeds per SKU"),
+          DTOutput("table_bpm_view")
+        ),
+      )
+    ),
+
+      header = tags$div(style="position: absolute; right: 20px; top: 10px; z-index: 1000;", 
+                        actionButton("logout_btn", "Logout", class="btn-sm btn-outline-danger"))
+    ))
 }
 
 # The actual UI that Shiny loads initially
@@ -460,6 +548,88 @@ server <- function(input, output, session) {
     updateSelectInput(session, "in_sku", choices = skus)
     updateSelectInput(session, "cap_vol", choices = vols)
   })
+
+  # --- UNIFIED LINE-SKU MAPPING LOGIC (SELECTIZE VERSION) ---
+  observe({
+    # Reactive dependencies
+    input$map_line
+    refresh_data()
+    refresh_cfg()
+    
+    # Only proceed if authenticated and line selected
+    req(auth$logged_in, input$map_line)
+    
+    cat("=== Updating SKU Selectize for", input$map_line, "===\n")
+    
+    # 1. Fetch ALL available SKUs from database
+    all_skus <- tryCatch({
+      skus <- dbGetQuery(db_pool, "SELECT sku_name FROM config_skus ORDER BY sku_name")$sku_name
+      cat("Fetched", length(skus), "SKUs from database\n")
+      skus
+    }, error = function(e) {
+      cat("ERROR fetching SKUs:", e$message, "\n")
+      showNotification(paste("Database error:", e$message), type = "error")
+      character(0)
+    })
+    
+    # 2. Fetch SKUs currently assigned to the selected line
+    current_mapping <- tryCatch({
+      mapped <- dbGetQuery(db_pool, sprintf(
+        "SELECT sku_name FROM config_line_sku_mapping WHERE line_no = '%s'", 
+        input$map_line
+      ))$sku_name
+      cat("Current mapping:", length(mapped), "SKUs\n")
+      mapped
+    }, error = function(e) {
+      cat("ERROR fetching mapping:", e$message, "\n")
+      character(0)
+    })
+    
+    # 3. Update the selectizeInput
+    updateSelectizeInput(
+      session = session,
+      inputId = "map_skus",
+      choices = all_skus,
+      selected = current_mapping,
+      server = TRUE
+    )
+    
+    cat("Selectize updated with", length(all_skus), "choices,", length(current_mapping), "selected\n\n")
+  })
+  
+  # Populate Breakdown Reason suggestions from history
+  observe({
+    refresh_data() # Trigger update when new data is logged
+    req(auth$logged_in)
+    
+    # Fetch unique reasons previously entered in the system
+    historical_reasons <- tryCatch({
+      dbGetQuery(db_pool, "SELECT DISTINCT reason FROM breakdowns ORDER BY reason")$reason
+    }, error = function(e) character(0))
+    
+    # Update the selectizeInput with historical data
+    updateSelectizeInput(
+      session = session,
+      inputId = "bd_rsn",
+      choices = historical_reasons,
+      server = TRUE
+    )
+  })
+
+  # Select All button
+  observeEvent(input$select_all_skus, {
+    req(auth$logged_in)
+    all_skus <- dbGetQuery(db_pool, "SELECT sku_name FROM config_skus ORDER BY sku_name")$sku_name
+    updateSelectizeInput(session, "map_skus", selected = all_skus)
+    cat("Selected all SKUs\n")
+  })
+  
+  # Deselect All button
+  observeEvent(input$deselect_all_skus, {
+    updateSelectizeInput(session, "map_skus", selected = character(0))
+    cat("Cleared all selections\n")
+  })
+
 # --- CONFIG: ADD ENGINEER ---
   observeEvent(input$save_eng, {
     req(input$new_eng) # Don't run if empty
@@ -477,7 +647,75 @@ server <- function(input, output, session) {
       showNotification(paste("Error:", e$message), type = "error")
     })
   })
+  # --- MACHINE DATABASE LOGIC ---
 
+  # 1. Save Machine to Database
+  observeEvent(input$save_machine, {
+    req(input$m_line, input$m_name)
+    
+    tryCatch({
+      dbExecute(db_pool, 
+                "INSERT INTO config_machines (line_no, machine_name) VALUES ($1, $2)",
+                list(input$m_line, input$m_name))
+      
+      showNotification(paste("Machine Added to", input$m_line), type = "message")
+      updateTextInput(session, "m_name", value = "") # Clear input after save
+      refresh_cfg(refresh_cfg() + 1) # Trigger table refresh
+      
+    }, error = function(e) {
+      showNotification(paste("Error:", e$message), type = "error")
+    })
+  })
+
+  # 2. Render the Machine Table with Delete Functionality
+  output$table_machines <- renderDT({
+    refresh_cfg()
+    req(input$m_line)
+    # Fetch data based on filter
+    query <- if(input$m_line == "All") {
+      "SELECT id, line_no, machine_name FROM config_machines ORDER BY line_no, machine_name"
+    } else {
+      sprintf("SELECT id, line_no, machine_name FROM config_machines WHERE line_no = '%s' ORDER BY machine_name", 
+              input$m_line)
+    }
+    
+    df <- dbGetQuery(db_pool, query)
+    
+    if(nrow(df) > 0) {
+      df$Actions <- paste0(
+        '<button class="btn btn-danger btn-sm" onclick="Shiny.setInputValue(\'delete_m_id\', ', df$id, ', {priority: \'event\'})">Delete</button>'
+      )
+    }
+    
+    datatable(df, escape = FALSE, selection = 'none', 
+              colnames = c("ID", "Line Number", "Machine Name", "Actions"),
+              options = list(pageLength = 10))
+  })
+
+  # 3. Handle Machine Deletion
+  observeEvent(input$delete_m_id, {
+    showModal(modalDialog(
+      title = "Confirm Deletion",
+      "Are you sure you want to remove this machine from the configuration?",
+      footer = tagList(
+        modalButton("Cancel"),
+        actionButton("confirm_m_del", "Yes, Delete", class = "btn-danger")
+      )
+    ))
+  })
+
+  observeEvent(input$confirm_m_del, {
+    removeModal()
+    req(input$delete_m_id)
+    
+    tryCatch({
+      dbExecute(db_pool, "DELETE FROM config_machines WHERE id = $1", list(input$delete_m_id))
+      showNotification("Machine Deleted", type = "warning")
+      refresh_cfg(refresh_cfg() + 1)
+    }, error = function(e) {
+      showNotification(e$message, type = "error")
+    })
+  })
   # --- CONFIG: ADD SKU ---
   observeEvent(input$save_sku, {
     req(input$sku_n, input$sku_v)
@@ -492,6 +730,7 @@ server <- function(input, output, session) {
       
       showNotification("SKU Saved/Updated Successfully!", type = "message")
       refresh_data(refresh_data() + 1)
+      refresh_cfg(refresh_cfg() + 1)  # Also trigger config refresh for Line-SKU mapping
       
     }, error = function(e) {
       showNotification(paste("Database Error:", e$message), type = "error")
@@ -640,50 +879,90 @@ server <- function(input, output, session) {
   })
   
   # --- HOURLY SUBMISSION ---
+  # --- STEP 1: VALIDATE AND SHOW MODAL ---
   observeEvent(input$submit_btn, {
-    req(input$in_line, input$in_sku, input$qty_debounced())
-    showNotification("Submitting Production Report...", id = "submitting", duration = NULL)
+    # Requirement: Must have recorded breakdowns OR "No Breakdown" checked
+    has_records <- nrow(temp_bds()) > 0
+    is_no_bd <- input$no_bd
+    
+    if (!has_records && !is_no_bd) {
+      showNotification("Error: You must record at least one breakdown or check 'No Breakdown' before submitting.", type = "error")
+      return()
+    }
+    
+    # If valid, show final summary modal
+    showModal(modalDialog(
+      title = "Final Review of Hourly Report",
+      h4("Production Summary"),
+      p(paste("Line:", input$in_line, "| SKU:", input$in_sku, "| Qty:", input$in_qty)),
+      hr(),
+      h4("Breakdown Summary"),
+      if(is_no_bd) p("Status: No breakdowns recorded for this hour.") else tableOutput("modal_bd_table"),
+      footer = tagList(
+        modalButton("Back to Edit"),
+        actionButton("final_confirm_btn", "Confirm & Save to Database", class = "btn-success")
+      )
+    ))
+  })
+
+  output$modal_bd_table <- renderTable({ temp_bds() })
+
+  # --- STEP 2: ACTUAL DATABASE INSERTION ---
+  observeEvent(input$final_confirm_btn, {
+    removeModal()
+    shinyjs::disable("submit_btn")
+    showNotification("Saving to database...", id = "saving", duration = NULL)
     
     tryCatch({
-      # Use the pool to checkout a connection
       con <- poolCheckout(db_pool)
-      dbBegin(con) # Use a transaction
+      dbBegin(con)
       
-      # 1. Correct the Join to use sku_name
+      # 1. Calculate Theoretical Value
       res_theo <- dbGetQuery(con, sprintf(
         "SELECT c.bpm, s.bottles_per_case FROM config_line_capacity c 
-         JOIN config_skus s ON c.sku_name = s.sku_name 
-         WHERE c.line_no = '%s' AND s.sku_name = '%s'", 
+        JOIN config_skus s ON c.sku_name = s.sku_name 
+        WHERE c.line_no = '%s' AND s.sku_name = '%s'", 
         input$in_line, input$in_sku
       ))
+      theo_val <- if(nrow(res_theo) > 0) (res_theo$bpm[1] * 60) / res_theo$bottles_per_case[1] else 0
       
-      theo_val <- if(nrow(res_theo) > 0) {
-        (res_theo$bpm[1] * 60) / res_theo$bottles_per_case[1]
-      } else { 0 }
-      
-      # 2. Use dbSendQuery for RETURNING clauses
-      insert_sql <- "INSERT INTO production_logs 
-                     (line_no, shift, prod_date, engineer, time_slot, sku, actual_qty, theo_output_val) 
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id"
-      
-      # Execute insert and fetch the returned ID
+      # 2. Insert Production Log and get ID
+      insert_sql <- "INSERT INTO production_logs (line_no, shift, prod_date, engineer, time_slot, sku, actual_qty, theo_output_val) 
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id"
       res <- dbSendQuery(con, insert_sql)
       dbBind(res, list(input$in_line, input$in_shift, as.character(input$in_date), 
-                       input$in_eng, input$in_time, input$in_sku, 
-                       input$qty_debounced(), theo_val))
+                      input$in_eng, input$in_time, input$in_sku, 
+                      as.numeric(input$in_qty), theo_val))
       log_id <- dbFetch(res)$id[1]
       dbClearResult(res)
       
-      # ... (Rest of your breakdown loop logic) ...
-
+      # 3. Insert Breakdowns if they exist
+      bds <- temp_bds()
+      if(nrow(bds) > 0) {
+        for(i in 1:nrow(bds)) {
+          dbExecute(con, "INSERT INTO breakdowns (log_id, machine_name, reason, duration_min, bd_type) 
+                          VALUES ($1, $2, $3, $4, $5)", 
+                    list(log_id, bds$Machine[i], bds$Reason[i], bds$Min[i], bds$Type[i]))
+        }
+      }
+      
       dbCommit(con)
       poolReturn(con)
-      # ... (UI cleanup logic) ...
+      
+      # UI Cleanup
+      removeNotification("saving")
+      showNotification("Report Successfully Logged!", type = "message")
+      updateNumericInput(session, "in_qty", value = 0)
+      temp_bds(data.frame(Machine=character(), Reason=character(), Min=numeric(), Type=character(), stringsAsFactors = FALSE))
+      updateCheckboxInput(session, "no_bd", value = FALSE)
+      refresh_data(refresh_data() + 1)
+      shinyjs::enable("submit_btn")
       
     }, error = function(e) {
       if(exists("con")) { dbRollback(con); poolReturn(con) }
-      removeNotification("submitting")
-      showNotification(paste("Submission Error:", e$message), type = "error")
+      removeNotification("saving")
+      shinyjs::enable("submit_btn")
+      showNotification(paste("Database Error:", e$message), type = "error")
     })
   })
 
@@ -694,17 +973,40 @@ server <- function(input, output, session) {
       "A" = c("07:00 - 08:00", "08:00 - 09:00", "09:00 - 10:00", "10:00 - 11:00", 
               "11:00 - 12:00", "12:00 - 13:00", "13:00 - 14:00", "14:00 - 15:00"),
       "B" = c("15:00 - 16:00", "16:00 - 17:00", "17:00 - 18:00", "18:00 - 19:00", 
-              "19:00 - 20:00", "20:00 - 21:00", "21:00 - 22:00", "22:00 - 23:00"),
-      "C" = c("23:00 - 00:00", "00:00 - 01:00", "01:00 - 02:00", "02:00 - 03:00", 
+              "19:00 - 20:00", "20:00 - 21:00", "21:00 - 22:00"),
+      "C" = c("22:00 - 23:00", "23:00 - 00:00", "00:00 - 01:00", "01:00 - 02:00", "02:00 - 03:00", 
               "03:00 - 04:00", "04:00 - 05:00", "05:00 - 06:00", "06:00 - 07:00")
     )
     
     updateSelectInput(session, "in_time", choices = shift_times)
   })
 
+  # --- FIXED ADD BREAKDOWN LOGIC ---
   observeEvent(input$add_bd, {
-    new_data <- data.frame(Reason = input$bd_rsn, Min = input$bd_min, Type = input$bd_tp)
-    temp_bds(rbind(temp_bds(), new_data))
+    # 1. Validation: Ensure all fields are filled before adding to list
+    req(input$bd_machine, input$bd_rsn != "", input$bd_min > 0, input$bd_tp)
+    
+    # 2. Uncheck "No Breakdown" if a user manually adds a breakdown
+    updateCheckboxInput(session, "no_bd", value = FALSE)
+    
+    # 3. Create the new record
+    new_row <- data.frame(
+      Machine = input$bd_machine, 
+      Reason  = input$bd_rsn, 
+      Min     = input$bd_min,
+      Type    = input$bd_tp,
+      stringsAsFactors = FALSE
+    )
+    
+    # 4. Append to the existing reactive data frame
+    current_list <- temp_bds()
+    temp_bds(rbind(current_list, new_row))
+    
+    # 5. Reset inputs for the next entry
+    updateTextInput(session, "bd_rsn", value = "")
+    updateNumericInput(session, "bd_min", value = 0)
+    
+    showNotification("Breakdown added to staged list.", type = "message")
   })
   
   output$temp_bd_list <- renderTable({ temp_bds() })
@@ -713,7 +1015,7 @@ server <- function(input, output, session) {
   qty_debounced <- reactive({ input$in_qty }) %>% debounce(500)
   # Live KPI Calculation
   output$live_calc_ui <- renderUI({
-    req(input$in_line, input$in_sku, qty_debounced())
+    req(input$in_line, input$in_sku, input$in_qty)
     # Fetch BPM for current selection
     res <- dbGetQuery(db_pool, sprintf(
       "SELECT c.bpm, s.bottles_per_case FROM config_line_capacity c 
@@ -737,12 +1039,6 @@ server <- function(input, output, session) {
     )
   }) %>% bindCache(input$in_line, input$in_sku, temp_bds())
 
-  # 1. Update Checkbox choices in Config
-  observe({
-    refresh_data()
-    all_skus <- dbGetQuery(db_pool, "SELECT sku_name FROM config_skus")$sku_name
-    updateCheckboxGroupInput(session, "map_skus", choices = all_skus)
-  })
   # 1. Display Current Mapped SKUs as Graphical Badges
 output$current_mapping_badges <- renderUI({
   req(input$map_line)
@@ -756,21 +1052,6 @@ output$current_mapping_badges <- renderUI({
   lapply(current, function(sku) {
     span(sku, class = "badge rounded-pill bg-primary", style = "margin-right: 5px; padding: 8px 12px; font-size: 0.9em;")
   })
-})
-
-# 2. Synchronize PickerInput selection with current mapping
-observeEvent(input$map_line, {
-  req(input$map_line)
-  # All possible SKUs
-  all_skus <- dbGetQuery(db_pool, "SELECT sku_name FROM config_skus")$sku_name
-  # Currently selected SKUs for this line
-  selected_skus <- dbGetQuery(db_pool, sprintf(
-    "SELECT sku_name FROM config_line_sku_mapping WHERE line_no = '%s'", input$map_line
-  ))$sku_name
-  
-  updatePickerInput(session, "map_skus", 
-                    choices = all_skus, 
-                    selected = selected_skus)
 })
 
   # 2. Save Mapping Logic
@@ -810,8 +1091,17 @@ observeEvent(input$map_line, {
     })
   })
 
+  # 1. Initialize Breakdown Data with Machine and Type
+  temp_bds <- reactiveVal(data.frame(Machine=character(), Reason=character(), Min=numeric(), Type=character()))
   # 3. THE STREAMLINE FILTER (For Hourly Entry Page)
   observeEvent(input$in_line, {
+    req(auth$logged_in)
+    m_choices <- dbGetQuery(db_pool, sprintf(
+    "SELECT machine_name FROM config_machines WHERE line_no = '%s' ORDER BY machine_name", 
+    input$in_line
+    ))$machine_name
+    updateSelectInput(session, "bd_machine", choices = m_choices)
+    
     # Only fetch SKUs assigned to the selected line
     available_skus <- dbGetQuery(db_pool, sprintf(
       "SELECT sku_name FROM config_line_sku_mapping WHERE line_no = '%s'", input$in_line
@@ -905,6 +1195,36 @@ observeEvent(input$map_line, {
     })
   })
 
+  # 1. Save Shift Material Usage
+  observeEvent(input$save_materials, {
+    # We fetch the latest shift/date from the production logs to stay in sync
+    last_shift <- dbGetQuery(db_pool, "SELECT prod_date, shift, line_no FROM production_logs ORDER BY id DESC LIMIT 1")
+    req(nrow(last_shift) > 0)
+    
+    tryCatch({
+      dbExecute(db_pool, 
+        "INSERT INTO material_usage (prod_date, shift, line_no, preform_qty_pcs, closure_qty_pcs, syrup_qty_liter, label_qty_kg, co2_qty_kg, high_low_fill_pcs) 
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        list(last_shift$prod_date[1], last_shift$shift[1], last_shift$line_no[1],
+            input$mat_preform, input$mat_closure, input$mat_syrup, 
+            input$mat_label, input$mat_co2, input$mat_fill_err)
+      )
+      showNotification("Material usage recorded for current shift.", type = "message")
+    }, error = function(e) showNotification(e$message, type = "error"))
+  })
+
+  # 2. Save Daily Power Usage
+  observeEvent(input$save_power, {
+    tryCatch({
+      dbExecute(db_pool, 
+        "INSERT INTO power_usage (usage_date, kwh_value) VALUES ($1, $2) 
+        ON CONFLICT (usage_date) DO UPDATE SET kwh_value = EXCLUDED.kwh_value",
+        list(as.character(input$power_date), input$power_kwh)
+      )
+      showNotification("Power usage record updated for the day.", type = "message")
+    }, error = function(e) showNotification(e$message, type = "error"))
+  })
+
   # --- ENGINEER TABLE WITH DELETE ---
   output$table_eng <- renderDT({
     refresh_data()
@@ -990,8 +1310,185 @@ observeEvent(input$map_line, {
       dbExecute(db_pool, "DELETE FROM config_skus WHERE id = $1", list(input$delete_sku_id))
       showNotification("SKU Deleted", type = "warning")
       refresh_data(refresh_data() + 1)
+      refresh_cfg(refresh_cfg() + 1)  # Also trigger config refresh
     }, error = function(e) { 
       showNotification("Cannot delete SKU: It is currently mapped to a Line Capacity entry.", type = "error") 
+    })
+  })
+
+  # --- SHIFT DATA CHECK SERVER LOGIC ---
+
+  # 1. Reactive container for the editable data
+  shift_check_data <- reactiveVal(NULL)
+
+  # 2. Fetch data for the 'Last Shift'
+  observe({
+    req(auth$logged_in)
+    input$refresh_check # Trigger on button press
+    
+    # This query identifies the most recent date/shift combination in the logs
+    query <- "
+      WITH last_s AS (
+        SELECT prod_date, shift FROM production_logs 
+        ORDER BY prod_date DESC, shift DESC LIMIT 1
+      )
+      SELECT id, line_no, shift, prod_date, time_slot, sku, actual_qty 
+      FROM production_logs 
+      WHERE (prod_date, shift) IN (SELECT prod_date, shift FROM last_s)
+      ORDER BY line_no, time_slot
+    "
+    df <- dbGetQuery(db_pool, query)
+    shift_check_data(df)
+  })
+
+  # 3. Render the Editable Table
+  output$table_shift_check <- renderDT({
+    datatable(
+      shift_check_data(),
+      editable = list(target = "cell", disable = list(columns = c(0:5))), # Only allow editing qty
+      selection = 'none',
+      options = list(pageLength = 25)
+    )
+  })
+
+  # 4. Handle User Edits
+  observeEvent(input$table_shift_check_cell_edit, {
+    info <- input$table_shift_check_cell_edit
+    df <- shift_check_data()
+    
+    # Update the reactive value with the new entry
+    df[info$row, info$col] <- as.numeric(info$value)
+    shift_check_data(df)
+  })
+
+  # 5. Finalize Changes to Database
+  observeEvent(input$finalize_shift, {
+    req(shift_check_data())
+    df <- shift_check_data()
+    
+    showModal(modalDialog(
+      title = "Confirm Updates",
+      "This will update the production quantities in the database. Continue?",
+      footer = tagList(
+        modalButton("Cancel"),
+        actionButton("confirm_shift_update", "Confirm Update", class = "btn-primary")
+      )
+    ))
+  })
+
+  observeEvent(input$confirm_shift_update, {
+    removeModal()
+    df <- shift_check_data()
+    
+    tryCatch({
+      con <- poolCheckout(db_pool)
+      dbBegin(con)
+      
+      # Loop through all rows and update actual_qty by ID
+      for(i in 1:nrow(df)) {
+        dbExecute(con, 
+                  "UPDATE production_logs SET actual_qty = $1 WHERE id = $2",
+                  list(df$actual_qty[i], df$id[i]))
+      }
+      
+      dbCommit(con)
+      poolReturn(con)
+      showNotification("Shift data finalized and updated successfully.", type = "message")
+      refresh_data(refresh_data() + 1) # Update dashboard and reports
+      
+    }, error = function(e) {
+      if(exists("con")) { dbRollback(con); poolReturn(con) }
+      showNotification(paste("Update Error:", e$message), type = "error")
+    })
+  })
+  # Reactive container for breakdowns
+  shift_bd_data <- reactiveVal(NULL)
+
+  # Fetch Breakdowns for the Last Shift
+  observe({
+    req(auth$logged_in)
+    input$refresh_check
+    
+    query <- "
+      SELECT b.id, p.line_no, b.machine_name, b.reason, b.duration_min, b.bd_type
+      FROM breakdowns b
+      JOIN production_logs p ON b.log_id = p.id
+      WHERE (p.prod_date, p.shift) IN (
+        SELECT prod_date, shift FROM production_logs ORDER BY prod_date DESC, shift DESC LIMIT 1
+      )
+    "
+    shift_bd_data(dbGetQuery(db_pool, query))
+  })
+
+  # Render Editable Breakdown Table
+  output$table_breakdown_check <- renderDT({
+    datatable(shift_bd_data(), 
+              editable = list(target = "cell", disable = list(columns = c(0, 1))), 
+              selection = 'none')
+  })
+
+  # Handle Breakdown Edits
+  observeEvent(input$table_breakdown_check_cell_edit, {
+    info <- input$table_breakdown_check_cell_edit
+    df <- shift_bd_data()
+    df[info$row, info$col] <- info$value
+    shift_bd_data(df)
+  })
+  output$download_shift_pdf <- downloadHandler(
+    filename = function() {
+      paste0("Shift_Report_", format(Sys.Date(), "%Y%m%d"), ".pdf")
+    },
+    content = function(file) {
+      # 1. Create a notification
+      id <- showNotification("Generating PDF...", duration = NULL, closeButton = FALSE)
+      on.exit(removeNotification(id), add = TRUE)
+
+      # 2. Copy template to a temp directory to avoid permission issues
+      tempReport <- file.path(tempdir(), "shift_report.Rmd")
+      file.copy("shift_report.Rmd", tempReport, overwrite = TRUE)
+
+      # 3. Prepare clean data frames (remove any non-serializable objects)
+      p_data <- as.data.frame(shift_check_data())
+      b_data <- as.data.frame(shift_bd_data())
+
+      # 4. Render the report
+      tryCatch({
+        rmarkdown::render(tempReport, output_file = file,
+                          params = list(prod = p_data, bds = b_data),
+                          envir = new.env(parent = globalenv()))
+      }, error = function(e) {
+        showNotification(paste("PDF Error:", e$message), type = "error", duration = 10)
+      })
+    }
+  )
+
+  observeEvent(input$confirm_shift_update, {
+    removeModal()
+    df_p <- shift_check_data()
+    df_b <- shift_bd_data()
+    
+    tryCatch({
+      con <- poolCheckout(db_pool)
+      dbBegin(con)
+      
+      # Update Production Logs
+      for(i in 1:nrow(df_p)) {
+        dbExecute(con, "UPDATE production_logs SET actual_qty = $1 WHERE id = $2",
+                  list(df_p$actual_qty[i], df_p$id[i]))
+      }
+      
+      # Update Breakdowns
+      for(i in 1:nrow(df_b)) {
+        dbExecute(con, "UPDATE breakdowns SET machine_name = $1, reason = $2, duration_min = $3, bd_type = $4 WHERE id = $5",
+                  list(df_b$machine_name[i], df_b$reason[i], df_b$duration_min[i], df_b$bd_type[i], df_b$id[i]))
+      }
+      
+      dbCommit(con)
+      poolReturn(con)
+      showNotification("All shift data updated successfully.", type = "message")
+    }, error = function(e) {
+      if(exists("con")) { dbRollback(con); poolReturn(con) }
+      showNotification(paste("Error:", e$message), type = "error")
     })
   })
 }
