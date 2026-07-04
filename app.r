@@ -46,7 +46,7 @@ ui_main_app <- function(role) {
       )
     ),
     
-    # HOURLY ENTRY PAGE
+    # HOURLY ENTRY PAGE (RESTRUCTURED)
     tabPanel("Hourly Entry",
       sidebarLayout(
         sidebarPanel(
@@ -56,39 +56,56 @@ ui_main_app <- function(role) {
           dateInput("in_date", "Date:", value = Sys.Date()),
           selectInput("in_eng", "Shift Engineer:", choices = NULL),
           hr(),
-          h4("Production Data"),
-          selectInput("in_time", "Time Duration:", choices = NULL),
-          selectInput("in_sku", "SKU Name:", choices = NULL),
-          numericInput("in_qty", "Actual Production (Cases):", value = 0),
-          actionButton("submit_btn", "Submit Hourly Report", class = "btn-success", width = "100%")
+          actionButton("submit_btn", "Submit Hourly Report", class = "btn-success", width = "100%", style = "margin-top: 10px;")
         ),
         mainPanel(
-          h4("Breakdowns in this Hour"),
-          fluidRow(
-            column(4, selectInput("bd_machine", "Machine", choices = NULL)), # Populated by server
-            column(4, selectizeInput(
-              inputId = "bd_rsn", 
-              label = "Reason", 
-              choices = NULL, # Populated dynamically from DB
-              options = list(
-                placeholder = 'Type or select reason...',
-                create = TRUE,       # Allows typing a brand new reason
-                maxOptions = 10,     # Keeps the list manageable
-                openOnFocus = TRUE   # Shows suggestions immediately on click
-              )
-            )),
-            column(4, selectInput("bd_tp", "Type", choices = c("Operational", "Maintenance", "ChangeOver", "Utility")))
-          ),
-          fluidRow(
-            column(3, numericInput("bd_min", "Duration (Min)", 0, min = 0)),
-            column(2, actionButton("add_bd", "+", class = "btn-info", style = "margin-top: 25px;")),
-            column(7, checkboxInput("no_bd", "No Breakdown for this hour", value = FALSE))
-          ),
-          hr(),
-          h4("Staged Breakdowns"),
-          tableOutput("temp_bd_list"),
-          hr(),
-          uiOutput("live_calc_ui")
+          tabsetPanel(
+            id = "hourly_entry_tabs",
+            
+            # SUB-TAB 1: PRODUCTION
+            tabPanel("Production Data",
+              br(),
+              wellPanel(
+                fluidRow(
+                  column(6, selectInput("in_time", "Time Duration:", choices = NULL)),
+                  column(6, selectInput("in_sku", "SKU Name:", choices = NULL))
+                ),
+                fluidRow(
+                  column(12, numericInput("in_qty", "Actual Production (Cases):", value = 0, width = "100%"))
+                )
+              ),
+              uiOutput("live_calc_ui")
+            ),
+            
+            # SUB-TAB 2: BREAKDOWNS
+            tabPanel("Breakdowns in this Hour",
+              br(),
+              wellPanel(
+                fluidRow(
+                  column(4, selectInput("bd_machine", "Machine", choices = NULL)),
+                  column(4, selectizeInput(
+                    inputId = "bd_rsn", 
+                    label = "Reason", 
+                    choices = NULL,
+                    options = list(placeholder = 'Type or select...', create = TRUE)
+                  )),
+                  column(4, selectInput("bd_tp", "Type", choices = c("Operational", "Maintenance", "ChangeOver", "Utility", "QC Checking")))
+                ),
+                fluidRow(
+                  column(4, numericInput("bd_min", "Duration (Min)", 0, min = 0)),
+                  column(4, 
+                    tags$div(
+                      style = "margin-top: 35px;", # Wrap the checkbox in a div to apply the style
+                      checkboxInput("no_bd", "No Breakdown for this hour", value = FALSE)
+                    )
+                  ),
+                  column(4, actionButton("add_bd", "Add Breakdown", icon = icon("plus"), class = "btn-info", style = "margin-top: 25px; width: 100%;"))
+                )
+              ),
+              h4("Staged Breakdowns"),
+              DTOutput("temp_bd_list_dt") # Changed to DT for better look
+            )
+          )
         )
       )
     ),
@@ -97,10 +114,12 @@ ui_main_app <- function(role) {
         tabPanel("Production & Breakdowns",
           fluidPage(
             h3("Last Shift Review (Coordinator View)"),
+            uiOutput("shift_review_subheading"),
             wellPanel(
               fluidRow(
                 column(6, 
                   actionButton("refresh_check", "Refresh Data", icon = icon("sync")),
+                  actionButton("update_live_data", "Update Table", class = "btn-warning", icon = icon("edit")),
                   actionButton("finalize_shift", "Finalize & Save All", class = "btn-success", icon = icon("check-double"))
                 ),
                 column(6, align = "right",
@@ -119,6 +138,14 @@ ui_main_app <- function(role) {
           fluidPage(
             h4("Shift Material Usage"),
             wellPanel(
+              # NEW: Header inputs to define which shift/line we are recording for
+              fluidRow(
+                column(4, dateInput("mat_date", "Date", value = Sys.Date())),
+                column(4, selectInput("mat_shift", "Shift", choices = c("A", "B", "C"))),
+                column(4, selectInput("mat_line", "Line", choices = c("Line-1", "Line-2", "Line-3", "Line-4", "Line-5", "Line-6")))
+              ),
+              hr(),
+              # Existing material fields
               fluidRow(
                 column(4, numericInput("mat_preform", "Preform Usage (pcs)", 0)),
                 column(4, numericInput("mat_closure", "Closure Usage (pcs)", 0)),
@@ -129,7 +156,7 @@ ui_main_app <- function(role) {
                 column(4, numericInput("mat_co2", "CO2 Usage (Kg)", 0, step = 0.1)),
                 column(4, numericInput("mat_fill_err", "High/Low Fill (pcs)", 0))
               ),
-              actionButton("save_materials", "Save Material Usage", class = "btn-primary")
+              actionButton("save_materials", "Save Material Usage", class = "btn-primary", width = "100%")
             ),
             hr(),
             h4("Daily Power Usage (24 Hours)"),
@@ -978,7 +1005,20 @@ server <- function(input, output, session) {
               "03:00 - 04:00", "04:00 - 05:00", "05:00 - 06:00", "06:00 - 07:00")
     )
     
-    updateSelectInput(session, "in_time", choices = shift_times)
+    # Get current hour (00-23)
+    curr_hr <- as.numeric(format(Sys.time(), "%H"))
+    
+    # Match current hour to the start of the time slot string
+    # e.g., if curr_hr is 08, it matches "08:00 - 09:00"
+    auto_selected <- grep(sprintf("^%02d:00", curr_hr), shift_times, value = TRUE)
+    
+    # If no match (e.g., current time is outside the selected shift's slots), 
+    # default to the first available slot.
+    if(length(auto_selected) == 0) auto_selected <- shift_times[1]
+    
+    updateSelectInput(session, "in_time", 
+                      choices = shift_times, 
+                      selected = auto_selected)
   })
 
   # --- FIXED ADD BREAKDOWN LOGIC ---
@@ -1009,7 +1049,21 @@ server <- function(input, output, session) {
     showNotification("Breakdown added to staged list.", type = "message")
   })
   
-  output$temp_bd_list <- renderTable({ temp_bds() })
+  # Render the staged breakdowns using DT for a cleaner UI
+  output$temp_bd_list_dt <- renderDT({
+    datatable(
+      temp_bds(),
+      options = list(dom = 't', paging = FALSE), # Minimalist view
+      selection = 'none',
+      rownames = FALSE
+    )
+  })
+
+  observeEvent(input$no_bd, {
+    if(input$no_bd) {
+      showNotification("Status set to 'No Breakdowns'.", type = "message")
+    }
+  })
 
   # 1. Create a debounced version of the quantity input
   qty_debounced <- reactive({ input$in_qty }) %>% debounce(500)
@@ -1197,6 +1251,10 @@ output$current_mapping_badges <- renderUI({
 
   # 1. Save Shift Material Usage
   observeEvent(input$save_materials, {
+    req(input$mat_line, input$mat_shift, input$mat_date)
+
+    showNotification("Saving material usage...", id = "mat_save", duration = NULL)
+
     # We fetch the latest shift/date from the production logs to stay in sync
     last_shift <- dbGetQuery(db_pool, "SELECT prod_date, shift, line_no FROM production_logs ORDER BY id DESC LIMIT 1")
     req(nrow(last_shift) > 0)
@@ -1319,7 +1377,8 @@ output$current_mapping_badges <- renderUI({
   # --- SHIFT DATA CHECK SERVER LOGIC ---
 
   # 1. Reactive container for the editable data
-  shift_check_data <- reactiveVal(NULL)
+  shift_check_data <- reactiveVal(data.frame()) 
+  shift_bd_data <- reactiveVal(data.frame())
 
   # 2. Fetch data for the 'Last Shift'
   observe({
@@ -1342,22 +1401,59 @@ output$current_mapping_badges <- renderUI({
   })
 
   # 3. Render the Editable Table
+  # Render the Editable Table with Role-Based Permissions
   output$table_shift_check <- renderDT({
+    df <- shift_check_data()
+    # Only render if df is a data frame and has columns
+    if (is.null(df) || ncol(df) == 0) return(NULL)
+    
+    # Determine which columns to disable based on role
+    # Admin can edit column 6 (actual_qty). Engineers/Others are locked out.
+
     datatable(
-      shift_check_data(),
-      editable = list(target = "cell", disable = list(columns = c(0:5))), # Only allow editing qty
-      selection = 'none',
-      options = list(pageLength = 25)
-    )
+        df,
+        editable = list(target = "cell", disable = list(columns = c(0:3))), # IDs/Date/Shift locked
+        selection = 'none',
+        rownames = FALSE, # CRITICAL: Keeps R index and DT index in sync
+        options = list(pageLength = 25)
+      )
+    })
+
+  # --- DYNAMIC SUBHEADING FOR SHIFT REVIEW ---
+  output$shift_review_subheading <- renderUI({
+    req(shift_check_data())
+    df <- shift_check_data()
+    
+    if(nrow(df) > 0) {
+      # Extract details from the first row of the retrieved data
+      view_date <- df$prod_date[1]
+      view_shift <- df$shift[1]
+      
+      # Since production_logs usually stores the engineer name, 
+      # we grab it from the database for this specific shift
+      eng_name <- dbGetQuery(db_pool, sprintf(
+        "SELECT engineer FROM production_logs WHERE prod_date = '%s' AND shift = '%s' LIMIT 1",
+        view_date, view_shift
+      ))$engineer[1]
+      
+      # Use tags to style the subheading
+      tags$div(
+        style = "margin-bottom: 20px; color: #7f8c8d; font-weight: 500;",
+        h5(paste0("Reviewing: ", view_date, " | Shift: ", view_shift, " | Engineer: ", ifelse(is.na(eng_name), "N/A", eng_name)))
+      )
+    } else {
+      p("No recent shift data found to review.", style = "color: gray;")
+    }
   })
 
   # 4. Handle User Edits
   observeEvent(input$table_shift_check_cell_edit, {
     info <- input$table_shift_check_cell_edit
-    df <- shift_check_data()
+    df <- as.data.frame(shift_check_data())
+    # info$col + 1 is the R-index
+    # Make sure this isn't accidentally overwriting the ID column!
+    df[info$row, info$col + 1] <- info$value
     
-    # Update the reactive value with the new entry
-    df[info$row, info$col] <- as.numeric(info$value)
     shift_check_data(df)
   })
 
@@ -1376,31 +1472,6 @@ output$current_mapping_badges <- renderUI({
     ))
   })
 
-  observeEvent(input$confirm_shift_update, {
-    removeModal()
-    df <- shift_check_data()
-    
-    tryCatch({
-      con <- poolCheckout(db_pool)
-      dbBegin(con)
-      
-      # Loop through all rows and update actual_qty by ID
-      for(i in 1:nrow(df)) {
-        dbExecute(con, 
-                  "UPDATE production_logs SET actual_qty = $1 WHERE id = $2",
-                  list(df$actual_qty[i], df$id[i]))
-      }
-      
-      dbCommit(con)
-      poolReturn(con)
-      showNotification("Shift data finalized and updated successfully.", type = "message")
-      refresh_data(refresh_data() + 1) # Update dashboard and reports
-      
-    }, error = function(e) {
-      if(exists("con")) { dbRollback(con); poolReturn(con) }
-      showNotification(paste("Update Error:", e$message), type = "error")
-    })
-  })
   # Reactive container for breakdowns
   shift_bd_data <- reactiveVal(NULL)
 
@@ -1422,18 +1493,38 @@ output$current_mapping_badges <- renderUI({
 
   # Render Editable Breakdown Table
   output$table_breakdown_check <- renderDT({
-    datatable(shift_bd_data(), 
-              editable = list(target = "cell", disable = list(columns = c(0, 1))), 
-              selection = 'none')
+    df <- shift_bd_data()
+    # Only proceed if df is a valid data frame
+    req(is.data.frame(df), ncol(df) > 0)
+    datatable(
+      df, 
+      editable = list(target = "cell", disable = list(columns = c(0, 1))), 
+      selection = 'none',
+      rownames = FALSE # CRITICAL: Keeps indices aligned with the observer
+    )
   })
 
   # Handle Breakdown Edits
   observeEvent(input$table_breakdown_check_cell_edit, {
     info <- input$table_breakdown_check_cell_edit
-    df <- shift_bd_data()
-    df[info$row, info$col] <- info$value
+    # CRITICAL: You must pull the current data frame first
+    df <- as.data.frame(shift_bd_data()) 
+    
+    # Update the specific cell
+    df[info$row, info$col + 1] <- info$value
+    
+    # Save the full data frame back to the reactive value
     shift_bd_data(df)
   })
+
+  observeEvent(input$update_live_data, {
+    req(shift_check_data())
+    # This forces a clean re-render of the tables with the edited values
+    shift_check_data(shift_check_data())
+    shift_bd_data(shift_bd_data())
+    showNotification("Table values cached. Click 'Finalize' to save to Database.", type = "message")
+  })
+  
   output$download_shift_pdf <- downloadHandler(
     filename = function() {
       paste0("Shift_Report_", format(Sys.Date(), "%Y%m%d"), ".pdf")
@@ -1473,19 +1564,33 @@ output$current_mapping_badges <- renderUI({
       
       # Update Production Logs
       for(i in 1:nrow(df_p)) {
+        # Using [[ ]] ensures we grab the column even if there's a slight name mismatch
+        # Ensure the column name here matches exactly what is in your 'production_logs' table
+        val <- as.numeric(df_p[i, "actual_qty"]) 
+        id_val <- as.integer(df_p[i, "id"])
         dbExecute(con, "UPDATE production_logs SET actual_qty = $1 WHERE id = $2",
-                  list(df_p$actual_qty[i], df_p$id[i]))
+                  list(val, id_val)
+        )
       }
       
       # Update Breakdowns
       for(i in 1:nrow(df_b)) {
         dbExecute(con, "UPDATE breakdowns SET machine_name = $1, reason = $2, duration_min = $3, bd_type = $4 WHERE id = $5",
-                  list(df_b$machine_name[i], df_b$reason[i], df_b$duration_min[i], df_b$bd_type[i], df_b$id[i]))
-      }
+                  list(
+                    as.character(df_b$machine_name[i]), 
+                    as.character(df_b$reason[i]), 
+                    as.numeric(df_b$duration_min[i]), 
+                    as.character(df_b$bd_type[i]),
+                    as.integer(df_b$id[i])
+                  )
+                )
+              }
       
       dbCommit(con)
       poolReturn(con)
       showNotification("All shift data updated successfully.", type = "message")
+      # Refresh data to show the confirmed values from DB
+      shinyjs::click("refresh_check")
     }, error = function(e) {
       if(exists("con")) { dbRollback(con); poolReturn(con) }
       showNotification(paste("Error:", e$message), type = "error")
